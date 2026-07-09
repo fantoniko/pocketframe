@@ -1,0 +1,16 @@
+# Direct HTTP URL of the JPEG returned by your LAN service.
+# Use a fixed IPv4 address or a local DNS name that PocketBook can resolve.
+url=http://192.168.1.50:8080/frame.jpg?token=replace-with-your-token
+
+# Optional manifest. The server returns revision and timer values in one small
+# response. Identical revision means that the JPEG is not downloaded at all.
+manifest_url=http://192.168.1.50:8080/manifest?token=replace-with-your-token
+
+# The default is 60 minutes. Minimum: 5 minutes.
+interval_minutes=60
+
+# Used when Wi-Fi or the server cannot be reached. Minimum: 5 minutes.
+retry_minutes=30
+
+# Each request is aborted after this period. Range: 5-60 seconds.
+timeout_seconds=15

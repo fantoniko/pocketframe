@@ -9,7 +9,101 @@ Building from source requires Docker or Docker compatible software and the inter
 
 1) Build binary from source by running `./build.sh` on Linux/WSL or `.\build.ps1` on Windows PowerShell.
 2) Copy `pocketframe.app` binary from the `build/` directory to the device `applications` directory.
-3) Create folder `My pictures/PocketFrame/` and copy desired `jpeg` pictures to it.
+3) For LAN frame mode, copy `pocketframe.cfg.example` to
+   `system/config/pocketframe.cfg` on the device, rename it to `pocketframe.cfg`,
+   and set `url` to a direct `http://` URL that responds with one JPEG image.
+
+Without `system/config/pocketframe.cfg`, PocketFrame keeps the original local
+slideshow mode: create `My pictures/PocketFrame/` and copy JPEG pictures there.
+
+### LAN photo frame
+
+`system/config/pocketframe.cfg` is read on startup and before each refresh:
+
+```ini
+url=http://192.168.1.50:8080/frame.jpg?token=replace-with-your-token
+manifest_url=http://192.168.1.50:8080/manifest?token=replace-with-your-token
+interval_minutes=60
+retry_minutes=30
+timeout_seconds=15
+```
+
+The image endpoint must return JPEG bytes themselves, not HTML or an image
+gallery. `manifest_url` is optional, but recommended. Its plain-text response
+uses `key=value` lines:
+
+```ini
+revision=42
+next_poll_seconds=3600
+retry_after_seconds=1800
+```
+
+`revision` is an opaque value, normally a content hash or monotonically
+increasing number. When it is unchanged, PocketFrame does not download the JPEG.
+`next_poll_seconds` lets the server use longer intervals at night; on an error,
+`retry_after_seconds` controls the next attempt. The configuration values are
+used when the manifest omits a timer. The app saves the last revision separately,
+so restarting it does not force a JPEG download.
+
+Use a fixed LAN IPv4 address where possible. The service should return
+`Cache-Control: no-store`. PocketFrame deliberately accepts only plain
+`http://`: a local endpoint avoids TLS startup cost and certificate compatibility
+issues of the older PocketBook runtime. Use a long random token in both URLs if
+the Wi-Fi network is shared.
+
+### Portainer server
+
+The server is a compact static Go image. It accepts an uploaded JPEG, PNG, or
+GIF, applies EXIF rotation for JPEG, converts it to a `1404x1872` grayscale JPEG
+at the configured quality, atomically publishes it, and returns a SHA-256
+revision. The final runtime image is `scratch`: it contains only the server
+binary and has no shell or package manager.
+
+Portainer Git Stacks do not reliably support `build:` from a repository. This
+project therefore publishes the server image to GHCR using
+`.github/workflows/publish-server.yml`; the stack only references that published
+image.
+
+1. Push the repository to GitHub. The workflow publishes
+   `ghcr.io/<github-owner>/pocketframe-server:latest`.
+2. In GitHub Packages, make the resulting container package public, or configure
+   GHCR registry credentials in Portainer.
+3. In Portainer select **Stacks**, **Add stack**, **Git Repository** and choose
+   `server/portainer-stack.yml` as the Compose path.
+4. In the stack environment variables set `POCKETFRAME_IMAGE` to the GHCR image
+   and set a random `POCKETFRAME_TOKEN` of at least 16 characters. The remaining
+   variables are listed in `server/stack.env.example`.
+
+The stack creates a named volume, so the last prepared frame survives container
+updates. It exposes the configured host port, by default `8080`.
+
+Find the server's LAN IPv4 address and put it plus the token in the PocketBook config:
+
+```ini
+url=http://192.168.1.50:8080/frame.jpg?token=the-guid-from-above
+manifest_url=http://192.168.1.50:8080/manifest?token=the-guid-from-above
+```
+
+Upload a JPEG, PNG, or GIF as a raw HTTP body. `curl.exe` example:
+
+```powershell
+curl.exe -X POST --data-binary "@C:\Photos\new-frame.jpg" -H "Content-Type: image/jpeg" "http://127.0.0.1:8080/api/frame?token=$token"
+```
+
+The response is the new manifest. The PocketBook only requests `/manifest` and
+`/frame.jpg`; it never uploads or processes the original image.
+
+For battery life, the default interval is one hour (minimum five minutes). The
+app connects only for the request, disconnects only when it started the
+connection itself, writes the flash cache only when the JPEG changed, and does
+not refresh the e-ink screen when the server returns identical image bytes. The
+last successful image remains on screen if Wi-Fi or the service is unavailable.
+Press the device's OK key while the frame is open to request an immediate refresh.
+
+The device must already know the Wi-Fi network in PocketBook settings. Leaving
+the app in the foreground is required for its timer to run; pressing Home pauses
+updates, and returning to PocketFrame restores the cached frame before the next
+network refresh.
 
 Alternatively, modify hardcoded settings in the source code (directory, time interval, debug switch).
 
