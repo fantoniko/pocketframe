@@ -20,6 +20,11 @@ static const char *PICTURE_DIRS[] = {
     "/mnt/ext2/My pictures/PocketFrame/",
     "/mnt/ext2/My Pictures/PocketFrame/",
 };
+static const int kMaxPath = 512;
+static const char *picture_dir = NULL;
+static char current_picture_name[kMaxPath] = "";
+
+static void show_next_picture();
 
 static void log_message(const char *msg) {
     if (!debug) {
@@ -43,22 +48,6 @@ static void show_status(const char *line_one, const char *line_two) {
                      ALIGN_CENTER);
     }
     FullUpdate();
-}
-
-static void show_startup_status() {
-    char screen_info[80];
-    snprintf(screen_info, sizeof(screen_info), "Screen: %dx%d", ScreenWidth(),
-             ScreenHeight());
-    show_status("PocketFrame starting...", screen_info);
-    sleep(1);
-}
-
-static void show_picture_status(ibitmap *picture) {
-    char picture_info[120];
-    snprintf(picture_info, sizeof(picture_info), "JPEG: %dx%d depth=%d",
-             picture->width, picture->height, picture->depth);
-    show_status("PocketFrame image loaded", picture_info);
-    sleep(1);
 }
 
 static int is_regular_file(const char *path) {
@@ -92,6 +81,11 @@ static const char *find_picture_dir() {
         }
     }
     return NULL;
+}
+
+static bool build_picture_path(const char *name, char *path, size_t path_size) {
+    int written = snprintf(path, path_size, "%s%s", picture_dir, name);
+    return written > 0 && static_cast<size_t>(written) < path_size;
 }
 
 static void draw_picture(ibitmap *picture) {
@@ -129,6 +123,113 @@ static void draw_picture(ibitmap *picture) {
             picture->scanline, x, y, draw_width, draw_height, 0);
 }
 
+static bool load_and_draw_picture(const char *name) {
+    char picfile[kMaxPath];
+    if (!build_picture_path(name, picfile, sizeof(picfile))) {
+        show_status("PocketFrame: path too long", name);
+        return false;
+    }
+
+    ibitmap *picture =
+        LoadJPEG(picfile, ScreenWidth(), ScreenHeight(), 100, 100, 1);
+    if (picture == NULL || picture->data == NULL) {
+        show_status("PocketFrame: JPEG load failed", picfile);
+        return false;
+    }
+
+    draw_picture(picture);
+    log_message(picfile);
+    FullUpdate();
+    return true;
+}
+
+static bool find_next_picture(char *name, size_t name_size) {
+    DIR *dir;
+    struct dirent *ent;
+    char first_picture[kMaxPath] = "";
+    char next_picture[kMaxPath] = "";
+    bool use_next_file = strlen(current_picture_name) == 0;
+
+    if ((dir = opendir(picture_dir)) == NULL) {
+        show_status("PocketFrame: could not open folder", picture_dir);
+        return false;
+    }
+
+    while ((ent = readdir(dir)) != NULL) {
+        char picfile[kMaxPath];
+        if (!build_picture_path(ent->d_name, picfile, sizeof(picfile))) {
+            continue;
+        }
+        if (!is_regular_file(picfile) || !is_jpeg_file(ent->d_name)) {
+            continue;
+        }
+
+        if (first_picture[0] == '\0') {
+            snprintf(first_picture, sizeof(first_picture), "%s", ent->d_name);
+        }
+
+        if (use_next_file) {
+            snprintf(next_picture, sizeof(next_picture), "%s", ent->d_name);
+            break;
+        }
+
+        if (strcmp(ent->d_name, current_picture_name) == 0) {
+            use_next_file = true;
+        }
+    }
+    closedir(dir);
+
+    if (next_picture[0] == '\0' && first_picture[0] != '\0') {
+        snprintf(next_picture, sizeof(next_picture), "%s", first_picture);
+    }
+    if (next_picture[0] == '\0') {
+        return false;
+    }
+
+    snprintf(name, name_size, "%s", next_picture);
+    return true;
+}
+
+static void schedule_next_picture(int ms) {
+    ClearTimer(show_next_picture);
+    SetWeakTimer("PocketFrameNext", show_next_picture, ms);
+}
+
+static void show_next_picture() {
+    char next_picture[kMaxPath];
+    if (picture_dir == NULL) {
+        return;
+    }
+
+    if (!find_next_picture(next_picture, sizeof(next_picture))) {
+        show_status("PocketFrame: no JPEG files found", picture_dir);
+        return;
+    }
+
+    snprintf(current_picture_name, sizeof(current_picture_name), "%s",
+             next_picture);
+    if (load_and_draw_picture(current_picture_name)) {
+        schedule_next_picture(PICTURE_DISPLAY_TIME * 1000);
+    } else {
+        schedule_next_picture(5000);
+    }
+}
+
+static void repaint_current_picture() {
+    if (picture_dir == NULL) {
+        return;
+    }
+    if (current_picture_name[0] == '\0') {
+        show_next_picture();
+        return;
+    }
+    if (load_and_draw_picture(current_picture_name)) {
+        schedule_next_picture(PICTURE_DISPLAY_TIME * 1000);
+    } else {
+        show_next_picture();
+    }
+}
+
 static int main_handler(int event_type, int param_one, int param_two) {
     if (EVT_INIT == event_type) {
         font = OpenFont("LiberationSans", kFontSize, 0);
@@ -136,9 +237,8 @@ static int main_handler(int event_type, int param_one, int param_two) {
         y_log = 0;
         ClearScreen();
         FullUpdate();
-        show_startup_status();
 
-        const char *picture_dir = find_picture_dir();
+        picture_dir = find_picture_dir();
         if (picture_dir == NULL) {
             show_status("PocketFrame: no picture folder",
                         "Create My pictures/PocketFrame on internal storage "
@@ -146,61 +246,15 @@ static int main_handler(int event_type, int param_one, int param_two) {
             return 0;
         }
 
-        // Read the content of a directory
-        // https://stackoverflow.com/a/612176
-        DIR *dir;
-        struct dirent *ent;
-        int pictures_shown = 0;
-        int pictures_failed = 0;
-        if ((dir = opendir(picture_dir)) != NULL) {
-            // Print all the files and directories within directory
-            while ((ent = readdir(dir)) != NULL) {
-                char picfile[300];
-                snprintf(picfile, sizeof(picfile), "%s%s", picture_dir,
-                         ent->d_name);
-
-                if (!is_regular_file(picfile) || !is_jpeg_file(ent->d_name)) {
-                    log_message(picfile);
-                    continue;
-                }
-
-                // Load picture and write it to a buffer
-                ibitmap *picture = LoadJPEG(picfile, ScreenWidth(), ScreenHeight(),
-                                            100, 100, 1);
-                if (picture == NULL || picture->data == NULL) {
-                    ++pictures_failed;
-                    show_status("PocketFrame: JPEG load failed", picfile);
-                    sleep(5);
-                    continue;
-                }
-
-                show_picture_status(picture);
-                draw_picture(picture);
-                log_message(picfile);
-                ++pictures_shown;
-
-                // Copy buffer to the real screen
-                FullUpdate();
-                sleep(PICTURE_DISPLAY_TIME);
-            }
-            closedir(dir);
-        } else {
-            // Could not open directory
-            show_status("PocketFrame: could not open folder", picture_dir);
-            return 0;
-        }
-
-        if (pictures_shown == 0) {
-            if (pictures_failed > 0) {
-                show_status("PocketFrame: no readable JPEG files", picture_dir);
-            } else {
-                show_status("PocketFrame: no JPEG files found", picture_dir);
-            }
-        } else {
-            show_status("PocketFrame: picture stream ended",
-                        "Press any key to close.");
-        }
-
+        current_picture_name[0] = '\0';
+        show_next_picture();
+    } else if (EVT_SHOW == event_type || EVT_REPAINT == event_type ||
+               EVT_FOREGROUND == event_type || EVT_ACTIVATE == event_type) {
+        repaint_current_picture();
+    } else if (EVT_HIDE == event_type || EVT_BACKGROUND == event_type) {
+        ClearTimer(show_next_picture);
+    } else if (EVT_EXIT == event_type) {
+        ClearTimer(show_next_picture);
         CloseFont(font);
     } else if (EVT_KEYPRESS == event_type) {
         CloseApp();
