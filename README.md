@@ -13,6 +13,32 @@ Building from source requires Docker or Docker compatible software and the inter
 
 Alternatively, modify hardcoded settings in the source code (directory, time interval, debug switch).
 
+### Preparing pictures
+
+Use `prepare-pocketbook-image.ps1` on Windows PowerShell to resize and convert pictures before
+copying them to the device.
+
+Full-screen crop for PocketBook 740 / InkPad 3:
+
+```powershell
+.\prepare-pocketbook-image.ps1 .\input.jpg .\output.jpg
+```
+
+Fit without cropping, with white margins if needed:
+
+```powershell
+.\prepare-pocketbook-image.ps1 .\input.jpg .\output.jpg -Mode Contain
+```
+
+If PowerShell blocks local scripts, run it without changing the system policy:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\prepare-pocketbook-image.ps1 .\input.jpg .\output.jpg
+```
+
+The script auto-rotates from EXIF, converts to grayscale, outputs `1404x1872` JPEG by default, and
+uses JPEG quality `85`.
+
 ### PocketBook 740 / firmware 6.x notes
 
 PocketBook 740 may expose the applications directory as `applications` instead of `Applications`.
