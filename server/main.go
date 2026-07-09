@@ -227,6 +227,11 @@ func (s *server) loadExistingFrame() error {
 	return nil
 }
 
+func revision(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
 func (s *server) publish(encoded []byte) (metadata, error) {
 	s.publishMu.Lock()
 	defer s.publishMu.Unlock()
