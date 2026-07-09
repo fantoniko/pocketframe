@@ -34,7 +34,7 @@ firmware generation.
 
 600x800 picture resolution is the actual fullscreen on the original Basic Touch target.
 For PocketBook 740 / InkPad 3, use 1404x1872 portrait images for the sharpest fullscreen output.
-The app centers decoded JPEG images on the screen without cropping them.
+The app scales JPEG images to fit the screen and centers them without cropping.
 SDK `Stretch` can resize photos of other dimensions as well.
 
 To prevent turning device off, disable power saving features.

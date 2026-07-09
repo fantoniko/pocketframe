@@ -45,6 +45,14 @@ static void show_status(const char *line_one, const char *line_two) {
     FullUpdate();
 }
 
+static void show_startup_status() {
+    char screen_info[80];
+    snprintf(screen_info, sizeof(screen_info), "Screen: %dx%d", ScreenWidth(),
+             ScreenHeight());
+    show_status("PocketFrame starting...", screen_info);
+    sleep(1);
+}
+
 static int is_regular_file(const char *path) {
     struct stat path_stat;
     if (stat(path, &path_stat) != 0) {
@@ -79,18 +87,38 @@ static const char *find_picture_dir() {
 }
 
 static void draw_picture(ibitmap *picture) {
-    int x = (ScreenWidth() - picture->width) / 2;
-    int y = (ScreenHeight() - picture->height) / 2;
-    if (x < 0) {
-        x = 0;
+    int screen_width = ScreenWidth();
+    int screen_height = ScreenHeight();
+    int draw_width = screen_width;
+    int draw_height = screen_height;
+
+    if (picture->width <= 0 || picture->height <= 0) {
+        show_status("PocketFrame: invalid JPEG size", "");
+        return;
     }
-    if (y < 0) {
-        y = 0;
+
+    if ((long long)picture->width * screen_height >
+        (long long)picture->height * screen_width) {
+        draw_height = (int)((long long)picture->height * screen_width /
+                            picture->width);
+    } else {
+        draw_width = (int)((long long)picture->width * screen_height /
+                           picture->height);
     }
+
+    if (draw_width < 1) {
+        draw_width = 1;
+    }
+    if (draw_height < 1) {
+        draw_height = 1;
+    }
+
+    int x = (screen_width - draw_width) / 2;
+    int y = (screen_height - draw_height) / 2;
 
     ClearScreen();
     Stretch(picture->data, IMAGE_GRAY2, picture->width, picture->height,
-            picture->scanline, x, y, picture->width, picture->height, 0);
+            picture->scanline, x, y, draw_width, draw_height, 0);
 }
 
 static int main_handler(int event_type, int param_one, int param_two) {
@@ -100,6 +128,7 @@ static int main_handler(int event_type, int param_one, int param_two) {
         y_log = 0;
         ClearScreen();
         FullUpdate();
+        show_startup_status();
 
         const char *picture_dir = find_picture_dir();
         if (picture_dir == NULL) {
