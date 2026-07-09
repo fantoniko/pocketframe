@@ -7,7 +7,7 @@ Digital picture frame from the PocketBook Basic Touch e-reader. See the [blog](h
 
 Building from source requires Docker or Docker compatible software and the internet connection for pulling dependencies.
 
-1) Build binary from source by running `./build.sh`
+1) Build binary from source by running `./build.sh` on Linux/WSL or `.\build.ps1` on Windows PowerShell.
 2) Copy `pocketframe.app` binary from the `build/` directory to the device `applications` directory.
 3) Create folder `My pictures/PocketFrame/` and copy desired `jpeg` pictures to it.
 
