@@ -78,6 +78,21 @@ static const char *find_picture_dir() {
     return NULL;
 }
 
+static void draw_picture(ibitmap *picture) {
+    int x = (ScreenWidth() - picture->width) / 2;
+    int y = (ScreenHeight() - picture->height) / 2;
+    if (x < 0) {
+        x = 0;
+    }
+    if (y < 0) {
+        y = 0;
+    }
+
+    ClearScreen();
+    Stretch(picture->data, IMAGE_GRAY2, picture->width, picture->height,
+            picture->scanline, x, y, picture->width, picture->height, 0);
+}
+
 static int main_handler(int event_type, int param_one, int param_two) {
     if (EVT_INIT == event_type) {
         font = OpenFont("LiberationSans", kFontSize, 0);
@@ -122,9 +137,7 @@ static int main_handler(int event_type, int param_one, int param_two) {
                     continue;
                 }
 
-                Stretch(picture->data, IMAGE_GRAY2, picture->width,
-                        picture->height, picture->scanline, 0, 0, ScreenWidth(),
-                        ScreenHeight(), 0);
+                draw_picture(picture);
                 log_message(picfile);
                 ++pictures_shown;
 
