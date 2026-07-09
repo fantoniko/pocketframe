@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 
 #include "inkview.h"
 
@@ -67,9 +68,13 @@ static char remote_revision[kMaxRevisionSize] = "";
 static bool remote_refresh_scheduled = false;
 static int remote_next_poll_seconds = kDefaultRefreshSeconds;
 static int remote_retry_seconds = kDefaultRetrySeconds;
+static time_t last_image_update_time = 0;
+static bool diagnostics_visible = false;
 
 static void show_next_picture();
 static void refresh_remote_picture();
+static void draw_diagnostics();
+static void repaint_current_picture();
 
 static void log_message(const char *msg) {
     if (!debug || strlen(msg) == 0) {
@@ -447,27 +452,43 @@ static void load_remote_state() {
         return;
     }
     char line[kMaxRevisionSize + 16];
-    if (fgets(line, sizeof(line), file) != NULL) {
+    while (fgets(line, sizeof(line), file) != NULL) {
         trim(line);
         const char *prefix = "revision=";
         if (strncmp(line, prefix, strlen(prefix)) == 0) {
             snprintf(remote_revision, sizeof(remote_revision), "%s",
                      line + strlen(prefix));
             have_remote_revision = remote_revision[0] != '\0';
+            continue;
+        }
+        prefix = "last_update=";
+        if (strncmp(line, prefix, strlen(prefix)) == 0) {
+            char *end = NULL;
+            long value = strtol(line + strlen(prefix), &end, 10);
+            if (end != line + strlen(prefix) && *end == '\0' && value > 0) {
+                last_image_update_time = static_cast<time_t>(value);
+            }
         }
     }
     fclose(file);
 }
 
 static bool save_remote_state() {
-    if (!have_remote_revision) {
+    if (!have_remote_revision && last_image_update_time == 0) {
         return true;
     }
     FILE *file = fopen(REMOTE_STATE_TEMP_PATH, "w");
     if (file == NULL) {
         return false;
     }
-    bool success = fprintf(file, "revision=%s\n", remote_revision) > 0;
+    bool success = true;
+    if (have_remote_revision) {
+        success = fprintf(file, "revision=%s\n", remote_revision) > 0;
+    }
+    if (success && last_image_update_time > 0) {
+        success = fprintf(file, "last_update=%ld\n",
+                          static_cast<long>(last_image_update_time)) > 0;
+    }
     if (fclose(file) != 0) {
         success = false;
     }
@@ -487,6 +508,65 @@ static void schedule_remote_refresh(int milliseconds) {
 static void clear_remote_refresh() {
     ClearTimer(refresh_remote_picture);
     remote_refresh_scheduled = false;
+}
+
+static void format_diagnostic_time(time_t value, char *text, size_t text_size) {
+    if (value <= 0) {
+        snprintf(text, text_size, "not available");
+        return;
+    }
+
+    struct tm *local = localtime(&value);
+    if (local == NULL || strftime(text, text_size, "%Y-%m-%d %H:%M", local) == 0) {
+        snprintf(text, text_size, "not available");
+    }
+}
+
+static void draw_diagnostics() {
+    int panel_width = ScreenWidth() / 2;
+    int panel_height = ScreenHeight() / 2;
+    int panel_x = (ScreenWidth() - panel_width) / 2;
+    int panel_y = (ScreenHeight() - panel_height) / 2;
+    int margin = kFontSize * 2;
+    int text_width = panel_width - margin * 2;
+    int line_height = kFontSize * 2;
+    int y = panel_y + margin;
+    char now[32];
+    char updated[32];
+    char line[64];
+
+    format_diagnostic_time(time(NULL), now, sizeof(now));
+    format_diagnostic_time(last_image_update_time, updated, sizeof(updated));
+
+    FillArea(panel_x, panel_y, panel_width, panel_height, WHITE);
+    DrawRect(panel_x, panel_y, panel_width - 1, panel_height - 1, BLACK);
+    DrawTextRect(panel_x + margin, y, text_width, line_height, "PocketFrame",
+                 ALIGN_CENTER);
+    y += line_height * 2;
+
+    snprintf(line, sizeof(line), "Time: %s", now);
+    DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
+    y += line_height;
+    snprintf(line, sizeof(line), "Updated: %s", updated);
+    DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
+    y += line_height;
+    snprintf(line, sizeof(line), "Battery: %d%%", GetBatteryPower());
+    DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
+
+    // The dialog is only black and white, so the low-energy E-Ink update is enough.
+    PartialUpdateBW(panel_x, panel_y, panel_width, panel_height);
+}
+
+static void open_diagnostics() {
+    ClearTimer(show_next_picture);
+    clear_remote_refresh();
+    diagnostics_visible = true;
+    draw_diagnostics();
+}
+
+static void close_diagnostics() {
+    diagnostics_visible = false;
+    repaint_current_picture();
 }
 
 static bool refresh_remote_picture_now() {
@@ -554,8 +634,9 @@ static bool refresh_remote_picture_now() {
             snprintf(remote_revision, sizeof(remote_revision), "%s",
                      manifest.revision);
             have_remote_revision = true;
-            save_remote_state();
         }
+        last_image_update_time = time(NULL);
+        save_remote_state();
         free(received);
         return true;
     }
@@ -583,13 +664,14 @@ static bool refresh_remote_picture_now() {
         snprintf(remote_revision, sizeof(remote_revision), "%s",
                  manifest.revision);
         have_remote_revision = true;
-        save_remote_state();
     }
+    last_image_update_time = time(NULL);
+    save_remote_state();
     return true;
 }
 
 static void refresh_remote_picture() {
-    if (!remote_mode) {
+    if (!remote_mode || diagnostics_visible) {
         return;
     }
     bool success = refresh_remote_picture_now();
@@ -604,7 +686,7 @@ static void schedule_next_picture(int ms) {
 
 static void show_next_picture() {
     char next_picture[kMaxPath];
-    if (picture_dir == NULL) {
+    if (picture_dir == NULL || diagnostics_visible) {
         return;
     }
 
@@ -644,12 +726,23 @@ static void repaint_current_picture() {
     if (remote_mode) {
         if (is_regular_file(REMOTE_CACHE_PATH)) {
             load_and_draw_path(REMOTE_CACHE_PATH, false);
-        } else {
+        } else if (!diagnostics_visible) {
             schedule_remote_refresh(100);
         }
-        if (!remote_refresh_scheduled) {
+        if (!diagnostics_visible && !remote_refresh_scheduled) {
             schedule_remote_refresh(remote_config.refresh_seconds * 1000);
         }
+        if (diagnostics_visible) {
+            draw_diagnostics();
+        }
+        return;
+    }
+
+    if (diagnostics_visible) {
+        if (current_picture_name[0] != '\0') {
+            load_and_draw_picture(current_picture_name);
+        }
+        draw_diagnostics();
         return;
     }
 
@@ -701,7 +794,17 @@ static int main_handler(int event_type, int param_one, int param_two) {
         clear_remote_refresh();
         CloseFont(font);
     } else if (EVT_KEYPRESS == event_type) {
-        if (remote_mode && param_one == KEY_OK) {
+        if (param_one == KEY_MENU) {
+            if (diagnostics_visible) {
+                close_diagnostics();
+            } else {
+                open_diagnostics();
+            }
+        } else if (remote_mode &&
+                   (param_one == KEY_RIGHT || param_one == KEY_OK)) {
+            if (diagnostics_visible) {
+                close_diagnostics();
+            }
             clear_remote_refresh();
             schedule_remote_refresh(100);
         } else if (param_one == KEY_BACK || param_one == KEY_HOME) {

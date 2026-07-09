@@ -98,7 +98,16 @@ app connects only for the request, disconnects only when it started the
 connection itself, writes the flash cache only when the JPEG changed, and does
 not refresh the e-ink screen when the server returns identical image bytes. The
 last successful image remains on screen if Wi-Fi or the service is unavailable.
-Press the device's OK key while the frame is open to request an immediate refresh.
+
+### Frame controls
+
+* Right-arrow (or OK) requests an immediate LAN refresh in remote mode.
+* Menu (the three-line button) toggles a centered diagnostic window with the
+  current time, time of the last image update, and battery percentage.
+
+The diagnostic window uses only a black-and-white partial E-Ink update. While it
+is open, the slideshow and network timers are paused; closing it redraws the
+current frame and resumes the normal timer.
 
 The device must already know the Wi-Fi network in PocketBook settings. Leaving
 the app in the foreground is required for its timer to run; pressing Home pauses
