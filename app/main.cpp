@@ -53,6 +53,14 @@ static void show_startup_status() {
     sleep(1);
 }
 
+static void show_picture_status(ibitmap *picture) {
+    char picture_info[120];
+    snprintf(picture_info, sizeof(picture_info), "JPEG: %dx%d depth=%d",
+             picture->width, picture->height, picture->depth);
+    show_status("PocketFrame image loaded", picture_info);
+    sleep(1);
+}
+
 static int is_regular_file(const char *path) {
     struct stat path_stat;
     if (stat(path, &path_stat) != 0) {
@@ -117,7 +125,7 @@ static void draw_picture(ibitmap *picture) {
     int y = (screen_height - draw_height) / 2;
 
     ClearScreen();
-    Stretch(picture->data, IMAGE_GRAY2, picture->width, picture->height,
+    Stretch(picture->data, picture->depth, picture->width, picture->height,
             picture->scanline, x, y, draw_width, draw_height, 0);
 }
 
@@ -166,6 +174,7 @@ static int main_handler(int event_type, int param_one, int param_two) {
                     continue;
                 }
 
+                show_picture_status(picture);
                 draw_picture(picture);
                 log_message(picfile);
                 ++pictures_shown;

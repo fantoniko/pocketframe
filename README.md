@@ -30,6 +30,9 @@ If tapping the app does absolutely nothing and no PocketFrame text appears, the 
 SDK/runtime mismatch rather than the picture files. Rebuild the binary with the SDK that matches your
 firmware generation.
 
+The startup diagnostics briefly show the screen size and decoded JPEG size/depth before the picture
+is rendered. This helps catch device-specific bitmap format issues.
+
 ### Useful tips
 
 600x800 picture resolution is the actual fullscreen on the original Basic Touch target.
