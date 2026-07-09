@@ -8,7 +8,14 @@ function Invoke-Docker {
         [string[]] $Arguments
     )
 
-    & docker @Arguments
+    & docker @Arguments 2>&1 | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) {
+            $_.Exception.Message
+        } else {
+            $_.ToString()
+        }
+    }
+
     if ($LASTEXITCODE -ne 0) {
         throw "docker $($Arguments -join ' ') failed with exit code $LASTEXITCODE"
     }
@@ -20,10 +27,7 @@ Invoke-Docker @("build", ".", "-t", "pocketbook", "--build-arg", "CACHEBUST=$cac
 
 $containerId = $null
 try {
-    $containerId = docker create pocketbook
-    if ($LASTEXITCODE -ne 0) {
-        throw "docker create pocketbook failed with exit code $LASTEXITCODE"
-    }
+    $containerId = Invoke-Docker @("create", "pocketbook")
     $containerId = $containerId.Trim()
 
     New-Item -ItemType Directory -Force build -ErrorAction Stop | Out-Null
@@ -32,6 +36,6 @@ try {
     Invoke-Docker @("cp", "${containerId}:/home/app/pocketframe.app", "build/pocketframe.app")
 } finally {
     if ($containerId) {
-        docker rm $containerId | Out-Null
+        Invoke-Docker @("rm", $containerId) | Out-Null
     }
 }

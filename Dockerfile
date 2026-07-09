@@ -1,4 +1,4 @@
-FROM ubuntu:20.04 as builder
+FROM ubuntu:20.04 AS builder
 
 # Install required packages, gcc-multilib for the 32bit ELF support
 RUN apt-get update && apt-get -y install build-essential git zip gcc-multilib \
