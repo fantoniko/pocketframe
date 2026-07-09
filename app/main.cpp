@@ -801,7 +801,8 @@ static int main_handler(int event_type, int param_one, int param_two) {
                 open_diagnostics();
             }
         } else if (remote_mode &&
-                   (param_one == KEY_RIGHT || param_one == KEY_OK)) {
+                   (param_one == KEY_RIGHT || param_one == KEY_NEXT ||
+                    param_one == KEY_NEXT2 || param_one == KEY_OK)) {
             if (diagnostics_visible) {
                 close_diagnostics();
             }

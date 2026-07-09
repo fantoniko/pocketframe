@@ -101,7 +101,8 @@ last successful image remains on screen if Wi-Fi or the service is unavailable.
 
 ### Frame controls
 
-* Right-arrow (or OK) requests an immediate LAN refresh in remote mode.
+* Right-arrow, Page Forward, or OK requests an immediate LAN refresh in remote
+  mode. The screen changes only if the server returns a new revision.
 * Menu (the three-line button) toggles a centered diagnostic window with the
   current time, time of the last image update, and battery percentage.
 
