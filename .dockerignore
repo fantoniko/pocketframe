@@ -1,0 +1,10 @@
+.git
+.github
+build
+build.log
+server
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.env

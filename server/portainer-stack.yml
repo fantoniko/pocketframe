@@ -1,17 +1,33 @@
 services:
   pocketframe-server:
     image: ${POCKETFRAME_IMAGE}
+    pull_policy: always
     container_name: pocketframe-server
     restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: ${POCKETFRAME_MEMORY_LIMIT:-384m}
     ports:
       - "${POCKETFRAME_PORT:-8080}:8080"
     environment:
-      POCKETFRAME_TOKEN: ${POCKETFRAME_TOKEN}
+      POCKETFRAME_TOKEN: ${POCKETFRAME_TOKEN:-}
+      POCKETFRAME_READ_TOKEN: ${POCKETFRAME_READ_TOKEN:-}
+      POCKETFRAME_UPLOAD_TOKEN: ${POCKETFRAME_UPLOAD_TOKEN:-}
       POCKETFRAME_MODE: ${POCKETFRAME_MODE:-cover}
       POCKETFRAME_QUALITY: ${POCKETFRAME_QUALITY:-85}
       POCKETFRAME_MAX_UPLOAD_MB: ${POCKETFRAME_MAX_UPLOAD_MB:-15}
+      POCKETFRAME_MAX_IMAGE_MEGAPIXELS: ${POCKETFRAME_MAX_IMAGE_MEGAPIXELS:-25}
       POCKETFRAME_NEXT_POLL_SECONDS: ${POCKETFRAME_NEXT_POLL_SECONDS:-3600}
       POCKETFRAME_RETRY_AFTER_SECONDS: ${POCKETFRAME_RETRY_AFTER_SECONDS:-1800}
+    healthcheck:
+      test: ["CMD", "/pocketframe-server", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     volumes:
       - pocketframe-data:/data
 

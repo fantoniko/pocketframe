@@ -22,8 +22,7 @@ function Invoke-Docker {
 }
 
 Write-Host "# Building container..."
-$cacheBust = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-Invoke-Docker @("build", ".", "-t", "pocketbook", "--build-arg", "CACHEBUST=$cacheBust", "-f", "Dockerfile", "--progress=plain")
+Invoke-Docker @("build", ".", "-t", "pocketbook", "-f", "Dockerfile", "--progress=plain")
 
 $containerId = $null
 try {

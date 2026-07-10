@@ -188,12 +188,14 @@ static bool load_and_draw_path(const char *path, bool report_error) {
         if (report_error) {
             show_status("PocketFrame: JPEG load failed", path);
         }
+        free(picture);
         return false;
     }
 
     draw_picture(picture);
     log_message(path);
     FullUpdate();
+    free(picture);
     return true;
 }
 
@@ -682,13 +684,19 @@ static bool refresh_remote_picture_now() {
         hash_bytes(static_cast<unsigned char *>(received), received_size);
     if (have_remote_hash && remote_hash == received_hash &&
         remote_size == static_cast<size_t>(received_size)) {
+        bool state_changed = false;
         if (use_manifest) {
-            snprintf(remote_revision, sizeof(remote_revision), "%s",
-                     manifest.revision);
-            have_remote_revision = true;
+            if (!have_remote_revision ||
+                strcmp(remote_revision, manifest.revision) != 0) {
+                snprintf(remote_revision, sizeof(remote_revision), "%s",
+                         manifest.revision);
+                have_remote_revision = true;
+                state_changed = true;
+            }
         }
-        last_image_update_time = time(NULL);
-        save_remote_state();
+        if (state_changed) {
+            save_remote_state();
+        }
         free(received);
         return true;
     }

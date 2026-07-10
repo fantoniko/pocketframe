@@ -9,9 +9,39 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+const testToken = "0123456789abcdef"
+
+func encodeTestJPEG(t *testing.T, width, height int) []byte {
+	t.Helper()
+	source := image.NewNRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			source.Set(x, y, color.NRGBA{R: uint8(x % 255), G: uint8(y % 255), B: 100, A: 255})
+		}
+	}
+	var encoded bytes.Buffer
+	if err := jpeg.Encode(&encoded, source, nil); err != nil {
+		t.Fatal(err)
+	}
+	return encoded.Bytes()
+}
+
+func testConfig(framePath string) config {
+	return config{
+		readToken:      testToken,
+		uploadToken:    "fedcba9876543210",
+		framePath:      framePath,
+		mode:           "cover",
+		quality:        85,
+		maxUploadBytes: 15 * 1024 * 1024,
+		maxImagePixels: 25 * 1000 * 1000,
+	}
+}
 
 func TestPrepareProducesPocketBookGrayscale(t *testing.T) {
 	source := image.NewNRGBA(image.Rect(0, 0, 3, 4))
@@ -67,25 +97,9 @@ func TestOrientRotateClockwise(t *testing.T) {
 }
 
 func TestPublishCreatesPreparedFrame(t *testing.T) {
-	source := image.NewNRGBA(image.Rect(0, 0, 8, 8))
-	for y := 0; y < 8; y++ {
-		for x := 0; x < 8; x++ {
-			source.Set(x, y, color.NRGBA{R: uint8(x * 20), G: uint8(y * 20), B: 100, A: 255})
-		}
-	}
-
-	var encoded bytes.Buffer
-	if err := jpeg.Encode(&encoded, source, nil); err != nil {
-		t.Fatal(err)
-	}
-
 	directory := t.TempDir()
-	server := &server{config: config{
-		framePath: filepath.Join(directory, "frame.jpg"),
-		mode:      "cover",
-		quality:   85,
-	}}
-	meta, err := server.publish(encoded.Bytes())
+	server := &server{config: testConfig(filepath.Join(directory, "frame.jpg"))}
+	meta, err := server.publish(encodeTestJPEG(t, 8, 8))
 	if err != nil {
 		t.Fatalf("publish: %v", err)
 	}
@@ -125,7 +139,7 @@ func TestIsSupportedImage(t *testing.T) {
 func TestStatusRequiresTokenAndReturnsFrameMetadata(t *testing.T) {
 	updated := time.Date(2026, time.July, 10, 12, 0, 0, 0, time.UTC)
 	server := &server{
-		config: config{token: "0123456789abcdef", nextPollSeconds: 3600},
+		config: config{readToken: testToken, nextPollSeconds: 3600},
 		meta:   metadata{revision: "abc123", updatedAt: updated, frameBytes: 4567},
 	}
 
@@ -136,7 +150,7 @@ func TestStatusRequiresTokenAndReturnsFrameMetadata(t *testing.T) {
 	}
 
 	response := httptest.NewRecorder()
-	server.status(response, httptest.NewRequest(http.MethodGet, "/status?token=0123456789abcdef", nil))
+	server.status(response, httptest.NewRequest(http.MethodGet, "/status?token="+testToken, nil))
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
 	}
@@ -145,5 +159,93 @@ func TestStatusRequiresTokenAndReturnsFrameMetadata(t *testing.T) {
 	}
 	if got, want := response.Body.String(), "\"frame_bytes\":4567"; !bytes.Contains([]byte(got), []byte(want)) {
 		t.Fatalf("status body = %s, want %s", got, want)
+	}
+}
+
+func TestUploadRequiresSeparateBearerToken(t *testing.T) {
+	server := &server{config: testConfig(filepath.Join(t.TempDir(), "frame.jpg"))}
+	encoded := encodeTestJPEG(t, 8, 8)
+
+	readTokenRequest := httptest.NewRequest(http.MethodPost, "/api/frame?token="+testToken, bytes.NewReader(encoded))
+	readTokenRequest.Header.Set("Content-Type", "image/jpeg")
+	readTokenResponse := httptest.NewRecorder()
+	server.upload(readTokenResponse, readTokenRequest)
+	if readTokenResponse.Code != http.StatusNotFound {
+		t.Fatalf("read token upload status = %d, want %d", readTokenResponse.Code, http.StatusNotFound)
+	}
+
+	uploadRequest := httptest.NewRequest(http.MethodPost, "/api/frame", bytes.NewReader(encoded))
+	uploadRequest.Header.Set("Content-Type", "image/jpeg")
+	uploadRequest.Header.Set("Authorization", "Bearer "+server.config.uploadToken)
+	uploadResponse := httptest.NewRecorder()
+	server.upload(uploadResponse, uploadRequest)
+	if uploadResponse.Code != http.StatusCreated {
+		t.Fatalf("upload status = %d, want %d: %s", uploadResponse.Code, http.StatusCreated, uploadResponse.Body.String())
+	}
+	if _, err := os.Stat(server.config.framePath); err != nil {
+		t.Fatalf("published frame: %v", err)
+	}
+}
+
+func TestLegacyUploadQueryRemainsCompatible(t *testing.T) {
+	server := &server{config: testConfig(filepath.Join(t.TempDir(), "frame.jpg"))}
+	server.config.uploadToken = testToken
+	server.config.legacyUploadQuery = true
+	request := httptest.NewRequest(http.MethodPost, "/api/frame?token="+testToken,
+		bytes.NewReader(encodeTestJPEG(t, 4, 4)))
+	request.Header.Set("Content-Type", "image/jpeg")
+	response := httptest.NewRecorder()
+	server.upload(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("legacy upload status = %d, want %d", response.Code, http.StatusCreated)
+	}
+}
+
+func TestPublishRejectsExcessivePixelCount(t *testing.T) {
+	server := &server{config: testConfig(filepath.Join(t.TempDir(), "frame.jpg"))}
+	server.config.maxImagePixels = 100
+	_, err := server.publish(encodeTestJPEG(t, 20, 20))
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("publish error = %v, want pixel limit error", err)
+	}
+}
+
+func TestPublishDoesNotRewriteIdenticalFrame(t *testing.T) {
+	server := &server{config: testConfig(filepath.Join(t.TempDir(), "frame.jpg"))}
+	encoded := encodeTestJPEG(t, 8, 8)
+	first, err := server.publish(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Date(2020, time.January, 2, 3, 4, 5, 0, time.UTC)
+	if err := os.Chtimes(server.config.framePath, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	second, err := server.publish(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.revision != second.revision {
+		t.Fatalf("revision changed: %s != %s", first.revision, second.revision)
+	}
+	info, err := os.Stat(server.config.framePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.ModTime().Equal(oldTime) {
+		t.Fatalf("identical frame was rewritten at %s", info.ModTime())
+	}
+}
+
+func TestUploadRejectsKnownOversizedBodyBeforeReading(t *testing.T) {
+	server := &server{config: testConfig(filepath.Join(t.TempDir(), "frame.jpg"))}
+	server.config.maxUploadBytes = 2
+	request := httptest.NewRequest(http.MethodPost, "/api/frame", strings.NewReader("too large"))
+	request.Header.Set("Content-Type", "image/jpeg")
+	request.Header.Set("Authorization", "Bearer "+server.config.uploadToken)
+	response := httptest.NewRecorder()
+	server.upload(response, request)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("upload status = %d, want %d", response.Code, http.StatusRequestEntityTooLarge)
 	}
 }

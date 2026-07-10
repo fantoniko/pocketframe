@@ -8,11 +8,18 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 echo "# Building container..."
-docker build . -t pocketbook --build-arg CACHEBUST=$(date +%s) -f Dockerfile
+docker build . -t pocketbook -f Dockerfile
+
+CID=""
+cleanup() {
+    if [ -n "$CID" ]; then
+        docker rm "$CID" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT
+
 CID=$(docker create pocketbook)
 mkdir -p build
 # copy build artifacts from the container
 echo "# Copying built artifacts from the container..."
-docker cp ${CID}:/home/app/pocketframe.app build/pocketframe.app
-# Remove the container..."
-docker rm ${CID}
+docker cp "${CID}:/home/app/pocketframe.app" build/pocketframe.app

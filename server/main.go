@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -16,10 +18,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	xdraw "golang.org/x/image/draw"
@@ -31,11 +35,14 @@ const (
 )
 
 type config struct {
-	token             string
+	readToken         string
+	uploadToken       string
+	legacyUploadQuery bool
 	framePath         string
 	mode              string
 	quality           int
 	maxUploadBytes    int64
+	maxImagePixels    int64
 	nextPollSeconds   int
 	retryAfterSeconds int
 }
@@ -59,11 +66,20 @@ type statusResponse struct {
 type server struct {
 	config    config
 	mu        sync.RWMutex
+	uploadMu  sync.Mutex
 	publishMu sync.Mutex
 	meta      metadata
 }
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
+		if err := runHealthcheck(); err != nil {
+			log.Print(err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	config, err := loadConfig()
 	if err != nil {
 		log.Fatal(err)
@@ -75,6 +91,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /livez", server.live)
 	mux.HandleFunc("GET /healthz", server.health)
 	mux.HandleFunc("GET /manifest", server.manifest)
 	mux.HandleFunc("GET /status", server.status)
@@ -83,15 +100,51 @@ func main() {
 
 	address := ":" + getenv("PORT", "8080")
 	log.Printf("PocketFrame server listening on %s", address)
-	if err := http.ListenAndServe(address, mux); err != nil {
-		log.Fatal(err)
+	httpServer := &http.Server{
+		Addr:              address,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	serverErrors := make(chan error, 1)
+	go func() {
+		serverErrors <- httpServer.ListenAndServe()
+	}()
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	select {
+	case err := <-serverErrors:
+		if !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	case <-signals:
+		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownContext); err != nil {
+			log.Printf("graceful shutdown: %v", err)
+		}
 	}
 }
 
 func loadConfig() (config, error) {
-	token := os.Getenv("POCKETFRAME_TOKEN")
-	if len(token) < 16 {
-		return config{}, errors.New("POCKETFRAME_TOKEN must contain at least 16 characters")
+	legacyToken := os.Getenv("POCKETFRAME_TOKEN")
+	readToken := os.Getenv("POCKETFRAME_READ_TOKEN")
+	if readToken == "" {
+		readToken = legacyToken
+	}
+	uploadToken := os.Getenv("POCKETFRAME_UPLOAD_TOKEN")
+	legacyUploadQuery := uploadToken == "" && legacyToken != ""
+	if uploadToken == "" {
+		uploadToken = legacyToken
+	}
+	if len(readToken) < 16 {
+		return config{}, errors.New("POCKETFRAME_READ_TOKEN or POCKETFRAME_TOKEN must contain at least 16 characters")
+	}
+	if len(uploadToken) < 16 {
+		return config{}, errors.New("POCKETFRAME_UPLOAD_TOKEN or POCKETFRAME_TOKEN must contain at least 16 characters")
 	}
 
 	mode := strings.ToLower(getenv("POCKETFRAME_MODE", "cover"))
@@ -106,6 +159,10 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	maxImageMegapixels, err := getenvInt("POCKETFRAME_MAX_IMAGE_MEGAPIXELS", 25, 1, 200)
+	if err != nil {
+		return config{}, err
+	}
 	nextPollSeconds, err := getenvInt("POCKETFRAME_NEXT_POLL_SECONDS", 3600, 300, 86400)
 	if err != nil {
 		return config{}, err
@@ -116,14 +173,34 @@ func loadConfig() (config, error) {
 	}
 
 	return config{
-		token:             token,
+		readToken:         readToken,
+		uploadToken:       uploadToken,
+		legacyUploadQuery: legacyUploadQuery,
 		framePath:         getenv("POCKETFRAME_FRAME_PATH", "/data/frame.jpg"),
 		mode:              mode,
 		quality:           quality,
 		maxUploadBytes:    int64(maxMegabytes) * 1024 * 1024,
+		maxImagePixels:    int64(maxImageMegapixels) * 1000 * 1000,
 		nextPollSeconds:   nextPollSeconds,
 		retryAfterSeconds: retryAfterSeconds,
 	}, nil
+}
+
+func runHealthcheck() error {
+	client := http.Client{Timeout: 3 * time.Second}
+	response, err := client.Get("http://127.0.0.1:" + getenv("PORT", "8080") + "/livez")
+	if err != nil {
+		return fmt.Errorf("healthcheck request: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("healthcheck returned %s", response.Status)
+	}
+	return nil
+}
+
+func (s *server) live(writer http.ResponseWriter, request *http.Request) {
+	writer.WriteHeader(http.StatusNoContent)
 }
 
 func getenv(key, fallback string) string {
@@ -153,7 +230,7 @@ func (s *server) health(writer http.ResponseWriter, request *http.Request) {
 }
 
 func (s *server) manifest(writer http.ResponseWriter, request *http.Request) {
-	if !s.authorized(writer, request) {
+	if !s.authorizedRead(writer, request) {
 		return
 	}
 
@@ -169,7 +246,7 @@ func (s *server) manifest(writer http.ResponseWriter, request *http.Request) {
 }
 
 func (s *server) frame(writer http.ResponseWriter, request *http.Request) {
-	if !s.authorized(writer, request) {
+	if !s.authorizedRead(writer, request) {
 		return
 	}
 
@@ -187,7 +264,7 @@ func (s *server) frame(writer http.ResponseWriter, request *http.Request) {
 }
 
 func (s *server) status(writer http.ResponseWriter, request *http.Request) {
-	if !s.authorized(writer, request) {
+	if !s.authorizedRead(writer, request) {
 		return
 	}
 
@@ -215,14 +292,20 @@ func (s *server) status(writer http.ResponseWriter, request *http.Request) {
 }
 
 func (s *server) upload(writer http.ResponseWriter, request *http.Request) {
-	if !s.authorized(writer, request) {
+	if !s.authorizedUpload(writer, request) {
 		return
 	}
 	if !isSupportedImage(request.Header.Get("Content-Type")) {
 		http.Error(writer, "use image/jpeg, image/png, or image/gif", http.StatusUnsupportedMediaType)
 		return
 	}
+	if request.ContentLength > s.config.maxUploadBytes {
+		http.Error(writer, "image is too large", http.StatusRequestEntityTooLarge)
+		return
+	}
 
+	s.uploadMu.Lock()
+	defer s.uploadMu.Unlock()
 	request.Body = http.MaxBytesReader(writer, request.Body, s.config.maxUploadBytes)
 	encoded, err := io.ReadAll(request.Body)
 	if err != nil {
@@ -243,12 +326,30 @@ func (s *server) upload(writer http.ResponseWriter, request *http.Request) {
 	s.writeManifest(writer, http.StatusCreated, meta)
 }
 
-func (s *server) authorized(writer http.ResponseWriter, request *http.Request) bool {
-	if request.URL.Query().Get("token") != s.config.token {
+func secureTokenEqual(actual, expected string) bool {
+	return hmac.Equal([]byte(actual), []byte(expected))
+}
+
+func (s *server) authorizedRead(writer http.ResponseWriter, request *http.Request) bool {
+	if !secureTokenEqual(request.URL.Query().Get("token"), s.config.readToken) {
 		http.NotFound(writer, request)
 		return false
 	}
 	return true
+}
+
+func (s *server) authorizedUpload(writer http.ResponseWriter, request *http.Request) bool {
+	fields := strings.Fields(request.Header.Get("Authorization"))
+	if len(fields) == 2 && strings.EqualFold(fields[0], "Bearer") &&
+		secureTokenEqual(fields[1], s.config.uploadToken) {
+		return true
+	}
+	if s.config.legacyUploadQuery &&
+		secureTokenEqual(request.URL.Query().Get("token"), s.config.uploadToken) {
+		return true
+	}
+	http.NotFound(writer, request)
+	return false
 }
 
 func (s *server) writeManifest(writer http.ResponseWriter, status int, meta metadata) {
@@ -283,6 +384,15 @@ func (s *server) publish(encoded []byte) (metadata, error) {
 	s.publishMu.Lock()
 	defer s.publishMu.Unlock()
 
+	imageConfig, _, err := image.DecodeConfig(bytes.NewReader(encoded))
+	if err != nil {
+		return metadata{}, fmt.Errorf("read source dimensions: %w", err)
+	}
+	if imageConfig.Width <= 0 || imageConfig.Height <= 0 ||
+		int64(imageConfig.Width) > s.config.maxImagePixels/int64(imageConfig.Height) {
+		return metadata{}, fmt.Errorf("source image exceeds %d pixels", s.config.maxImagePixels)
+	}
+
 	source, _, err := image.Decode(bytes.NewReader(encoded))
 	if err != nil {
 		return metadata{}, fmt.Errorf("decode source image: %w", err)
@@ -309,6 +419,15 @@ func (s *server) publish(encoded []byte) (metadata, error) {
 	if err := temporary.Close(); err != nil {
 		return metadata{}, fmt.Errorf("close JPEG: %w", err)
 	}
+	newRevision := hex.EncodeToString(hasher.Sum(nil))
+	s.mu.RLock()
+	currentMeta := s.meta
+	s.mu.RUnlock()
+	if currentMeta.revision == newRevision {
+		if _, err := os.Stat(s.config.framePath); err == nil {
+			return currentMeta, nil
+		}
+	}
 	if err := os.Rename(temporaryPath, s.config.framePath); err != nil {
 		return metadata{}, fmt.Errorf("publish JPEG: %w", err)
 	}
@@ -318,7 +437,7 @@ func (s *server) publish(encoded []byte) (metadata, error) {
 		return metadata{}, fmt.Errorf("stat published JPEG: %w", err)
 	}
 	meta := metadata{
-		revision:   hex.EncodeToString(hasher.Sum(nil)),
+		revision:   newRevision,
 		updatedAt:  info.ModTime(),
 		frameBytes: info.Size(),
 	}

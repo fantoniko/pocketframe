@@ -1,0 +1,42 @@
+name: PocketFrame Client CI
+
+on:
+  push:
+    paths:
+      - app/**
+      - Dockerfile
+      - build.sh
+      - build.ps1
+      - .dockerignore
+      - .github/workflows/build-client.yml
+  pull_request:
+    paths:
+      - app/**
+      - Dockerfile
+      - build.sh
+      - build.ps1
+      - .dockerignore
+      - .github/workflows/build-client.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --tag pocketbook-client --file Dockerfile .
+      - name: Extract application
+        run: |
+          container_id=$(docker create pocketbook-client)
+          trap 'docker rm "$container_id" >/dev/null' EXIT
+          mkdir -p build
+          docker cp "$container_id:/home/app/pocketframe.app" build/pocketframe.app
+          test -s build/pocketframe.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pocketframe-app
+          path: build/pocketframe.app
+          if-no-files-found: error

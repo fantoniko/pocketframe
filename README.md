@@ -21,8 +21,8 @@ slideshow mode: create `My pictures/PocketFrame/` and copy JPEG pictures there.
 `system/config/pocketframe.cfg` is read on startup and before each refresh:
 
 ```ini
-url=http://192.168.1.50:8080/frame.jpg?token=replace-with-your-token
-manifest_url=http://192.168.1.50:8080/manifest?token=replace-with-your-token
+url=http://192.168.1.50:8080/frame.jpg?token=replace-with-read-token
+manifest_url=http://192.168.1.50:8080/manifest?token=replace-with-read-token
 interval_minutes=60
 refresh_mode=battery_saver
 retry_minutes=30
@@ -59,8 +59,7 @@ automatic checks using `interval_minutes`; keep PocketBook awake for that mode.
 Use a fixed LAN IPv4 address where possible. The service should return
 `Cache-Control: no-store`. PocketFrame deliberately accepts only plain
 `http://`: a local endpoint avoids TLS startup cost and certificate compatibility
-issues of the older PocketBook runtime. Use a long random token in both URLs if
-the Wi-Fi network is shared.
+issues of the older PocketBook runtime. Use the read-only token in both URLs.
 
 ### Portainer server
 
@@ -75,30 +74,40 @@ project therefore publishes the server image to GHCR using
 `.github/workflows/publish-server.yml`; the stack only references that published
 image.
 
-1. Push the repository to GitHub. The workflow publishes
-   `ghcr.io/<github-owner>/pocketframe-server:latest`.
+1. Push the repository to GitHub. The workflow publishes an immutable `sha-*`
+   tag and a sanitized branch tag. Pushes to `main` also publish `latest`.
 2. In GitHub Packages, make the resulting container package public, or configure
    GHCR registry credentials in Portainer.
 3. In Portainer select **Stacks**, **Add stack**, **Git Repository** and choose
    `server/portainer-stack.yml` as the Compose path.
-4. In the stack environment variables set `POCKETFRAME_IMAGE` to the GHCR image
-   and set a random `POCKETFRAME_TOKEN` of at least 16 characters. The remaining
+4. In the stack environment variables set `POCKETFRAME_IMAGE` to the GHCR image,
+   then set different random `POCKETFRAME_READ_TOKEN` and
+   `POCKETFRAME_UPLOAD_TOKEN` values of at least 16 characters. The remaining
    variables are listed in `server/stack.env.example`.
 
 The stack creates a named volume, so the last prepared frame survives container
-updates. It exposes the configured host port, by default `8080`.
+updates. It exposes the configured host port, by default `8080`, and runs with a
+read-only root filesystem, dropped Linux capabilities, a memory limit, and a
+built-in liveness check. Back up the `pocketframe-data` volume separately if the
+published frame must survive host disk loss.
+
+For an existing deployment, `POCKETFRAME_TOKEN` remains a backwards-compatible
+fallback for both operations. New deployments should use separate tokens. When
+deploying directly from a feature branch, use its published branch tag, for
+example `codex-pocketbook-740-fixes`, so Portainer can pull updates without
+editing the immutable SHA tag.
 
 Find the server's LAN IPv4 address and put it plus the token in the PocketBook config:
 
 ```ini
-url=http://192.168.1.50:8080/frame.jpg?token=the-guid-from-above
-manifest_url=http://192.168.1.50:8080/manifest?token=the-guid-from-above
+url=http://192.168.1.50:8080/frame.jpg?token=the-read-token-from-above
+manifest_url=http://192.168.1.50:8080/manifest?token=the-read-token-from-above
 ```
 
 Upload a JPEG, PNG, or GIF as a raw HTTP body. `curl.exe` example:
 
 ```powershell
-curl.exe -X POST --data-binary "@C:\Photos\new-frame.jpg" -H "Content-Type: image/jpeg" "http://127.0.0.1:8080/api/frame?token=$token"
+curl.exe -X POST --data-binary "@C:\Photos\new-frame.jpg" -H "Content-Type: image/jpeg" -H "Authorization: Bearer $uploadToken" "http://127.0.0.1:8080/api/frame"
 ```
 
 The response is the new manifest. The PocketBook only requests `/manifest` and
@@ -106,11 +115,13 @@ The response is the new manifest. The PocketBook only requests `/manifest` and
 status endpoint is also available for monitoring the active prepared frame:
 
 ```powershell
-curl.exe "http://127.0.0.1:8080/status?token=$token"
+curl.exe "http://127.0.0.1:8080/status?token=$readToken"
 ```
 
 It returns JSON with readiness, revision, publication time, prepared JPEG size,
-target dimensions, and the server's requested polling interval.
+target dimensions, and the server's requested polling interval. Uploads are
+limited both by encoded size and source pixel count; the defaults are 15 MB and
+25 megapixels.
 
 For battery life, the default mode avoids timed polling. Each request connects
 only for the request and disconnects immediately afterwards, writes the flash
@@ -131,9 +142,9 @@ is open, the slideshow and network timers are paused; closing it redraws the
 current frame. In `always_on` mode, the normal timer resumes.
 
 The device must already know the Wi-Fi network in PocketBook settings. Leaving
-the app in the foreground is required for its timer to run; pressing Home pauses
-updates, and returning to PocketFrame restores the cached frame before the next
-network refresh.
+the app in the foreground is required for its timer to run; pressing Home closes
+PocketFrame, and opening it again restores the cached frame before checking the
+network.
 
 Alternatively, modify hardcoded settings in the source code (directory, time interval, debug switch).
 
@@ -179,9 +190,6 @@ The app searches these picture directories:
 If tapping the app does absolutely nothing and no PocketFrame text appears, the likely issue is an
 SDK/runtime mismatch rather than the picture files. Rebuild the binary with the SDK that matches your
 firmware generation.
-
-The startup diagnostics briefly show the screen size and decoded JPEG size/depth before the picture
-is rendered. This helps catch device-specific bitmap format issues.
 
 ### Useful tips
 
