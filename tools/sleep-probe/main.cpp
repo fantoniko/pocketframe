@@ -68,7 +68,7 @@ static void draw_probe() {
                  kSleepSeconds);
         draw_line(y, line);
         y += kFontSize * 2;
-        draw_line(y, "Press OK to start one sleep cycle.");
+        draw_line(y, "Press Right/Page Forward to start.");
         y += kFontSize * 2;
         draw_line(y, "Back or Home exits. No automatic repeat.");
     } else if (probe_state == PROBE_PENDING) {
@@ -105,7 +105,7 @@ static void draw_probe() {
             draw_line(y, "Result: interrupted or suspend unsupported.");
         }
         y += kFontSize * 2;
-        draw_line(y, "Wait 3 sec, then press OK to repeat.");
+        draw_line(y, "Wait 3 sec, then press Right to repeat.");
     }
 
     FullUpdate();
@@ -147,7 +147,8 @@ static int main_handler(int event_type, int param_one, int param_two) {
                event_type == EVT_FOREGROUND || event_type == EVT_ACTIVATE) {
         draw_probe();
     } else if (event_type == EVT_KEYPRESS) {
-        if (param_one == KEY_OK) {
+        if (param_one == KEY_RIGHT || param_one == KEY_NEXT ||
+            param_one == KEY_NEXT2 || param_one == KEY_OK) {
             start_probe();
             return 1;
         }
