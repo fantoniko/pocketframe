@@ -24,7 +24,9 @@ slideshow mode: create `My pictures/PocketFrame/` and copy JPEG pictures there.
 url=http://192.168.1.50:8080/frame.jpg?token=replace-with-your-token
 manifest_url=http://192.168.1.50:8080/manifest?token=replace-with-your-token
 interval_minutes=60
+refresh_mode=battery_saver
 retry_minutes=30
+retry_max_minutes=240
 timeout_seconds=15
 ```
 
@@ -41,9 +43,18 @@ retry_after_seconds=1800
 `revision` is an opaque value, normally a content hash or monotonically
 increasing number. When it is unchanged, PocketFrame does not download the JPEG.
 `next_poll_seconds` lets the server use longer intervals at night; on an error,
-`retry_after_seconds` controls the next attempt. The configuration values are
-used when the manifest omits a timer. The app saves the last revision separately,
-so restarting it does not force a JPEG download.
+`retry_after_seconds` controls the first retry attempt. Each consecutive error
+doubles that delay, capped by `retry_max_minutes` (four hours by default), and a
+successful request resets the backoff. The configuration values are used when
+the manifest omits a timer. The app saves the last revision separately, so
+restarting it does not force a JPEG download.
+
+`refresh_mode=battery_saver` is the default and recommended for an e-reader: it
+checks once at app start and whenever PocketFrame returns to the foreground, or
+when Right, Page Forward, or OK is pressed. It does not continue timed polling
+after a successful check. If no cached frame exists, failed first-time setup
+continues with exponential retries. Set `refresh_mode=always_on` to schedule
+automatic checks using `interval_minutes`; keep PocketBook awake for that mode.
 
 Use a fixed LAN IPv4 address where possible. The service should return
 `Cache-Control: no-store`. PocketFrame deliberately accepts only plain
@@ -91,24 +102,33 @@ curl.exe -X POST --data-binary "@C:\Photos\new-frame.jpg" -H "Content-Type: imag
 ```
 
 The response is the new manifest. The PocketBook only requests `/manifest` and
-`/frame.jpg`; it never uploads or processes the original image.
+`/frame.jpg`; it never uploads or processes the original image. A protected
+status endpoint is also available for monitoring the active prepared frame:
 
-For battery life, the default interval is one hour (minimum five minutes). The
-app connects only for the request, disconnects only when it started the
-connection itself, writes the flash cache only when the JPEG changed, and does
-not refresh the e-ink screen when the server returns identical image bytes. The
-last successful image remains on screen if Wi-Fi or the service is unavailable.
+```powershell
+curl.exe "http://127.0.0.1:8080/status?token=$token"
+```
+
+It returns JSON with readiness, revision, publication time, prepared JPEG size,
+target dimensions, and the server's requested polling interval.
+
+For battery life, the default mode avoids timed polling. Each request connects
+only for the request and disconnects immediately afterwards, writes the flash
+cache only when the JPEG changed, and does not refresh the e-ink screen when the
+server returns an identical revision. The last successful image remains on
+screen if Wi-Fi or the service is unavailable.
 
 ### Frame controls
 
 * Right-arrow, Page Forward, or OK requests an immediate LAN refresh in remote
   mode. The screen changes only if the server returns a new revision.
 * Menu (the three-line button) toggles a centered diagnostic window with the
-  current time, time of the last image update, and battery percentage.
+  current time, image-update time, last network attempt/result/duration, and
+  success/failure counters.
 
 The diagnostic window uses only a black-and-white partial E-Ink update. While it
 is open, the slideshow and network timers are paused; closing it redraws the
-current frame and resumes the normal timer.
+current frame. In `always_on` mode, the normal timer resumes.
 
 The device must already know the Wi-Fi network in PocketBook settings. Leaving
 the app in the foreground is required for its timer to run; pressing Home pauses

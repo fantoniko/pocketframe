@@ -18,6 +18,7 @@ static const int PICTURE_DISPLAY_TIME = 300;  // Legacy local slideshow: 5 min.
 static const int kDefaultRefreshSeconds = 60 * 60;
 static const int kMinRefreshSeconds = 5 * 60;
 static const int kDefaultRetrySeconds = 30 * 60;
+static const int kDefaultRetryMaxSeconds = 4 * 60 * 60;
 static const int kMaxPollSeconds = 24 * 60 * 60;
 static const int kDefaultTimeoutSeconds = 15;
 static const int kMinTimeoutSeconds = 5;
@@ -47,7 +48,9 @@ struct RemoteConfig {
     char manifest_url[kConfigLineSize];
     int refresh_seconds;
     int retry_seconds;
+    int retry_max_seconds;
     int timeout_seconds;
+    bool automatic_refresh;
 };
 
 struct RemoteManifest {
@@ -68,7 +71,15 @@ static char remote_revision[kMaxRevisionSize] = "";
 static bool remote_refresh_scheduled = false;
 static int remote_next_poll_seconds = kDefaultRefreshSeconds;
 static int remote_retry_seconds = kDefaultRetrySeconds;
+static int remote_retry_max_seconds = kDefaultRetryMaxSeconds;
 static time_t last_image_update_time = 0;
+static time_t last_network_attempt_time = 0;
+static time_t last_network_success_time = 0;
+static int last_network_duration_seconds = 0;
+static int successful_network_checks = 0;
+static int failed_network_checks = 0;
+static int consecutive_network_failures = 0;
+static bool last_network_succeeded = false;
 static bool diagnostics_visible = false;
 
 static void show_next_picture();
@@ -272,7 +283,9 @@ static bool load_remote_config(RemoteConfig *config) {
     memset(config, 0, sizeof(*config));
     config->refresh_seconds = kDefaultRefreshSeconds;
     config->retry_seconds = kDefaultRetrySeconds;
+    config->retry_max_seconds = kDefaultRetryMaxSeconds;
     config->timeout_seconds = kDefaultTimeoutSeconds;
+    config->automatic_refresh = false;
 
     FILE *file = fopen(REMOTE_CONFIG_PATH, "r");
     if (file == NULL) {
@@ -314,12 +327,28 @@ static bool load_remote_config(RemoteConfig *config) {
                                   kMaxPollSeconds / 60, &minutes)) {
                 config->retry_seconds = minutes * 60;
             }
+        } else if (strcmp(key, "retry_max_minutes") == 0) {
+            int minutes;
+            if (parse_limited_int(value, kMinRefreshSeconds / 60,
+                                  kMaxPollSeconds / 60, &minutes)) {
+                config->retry_max_seconds = minutes * 60;
+            }
+        } else if (strcmp(key, "refresh_mode") == 0) {
+            if (strcmp(value, "always_on") == 0) {
+                config->automatic_refresh = true;
+            } else if (strcmp(value, "battery_saver") == 0) {
+                config->automatic_refresh = false;
+            }
         } else if (strcmp(key, "timeout_seconds") == 0) {
             parse_limited_int(value, kMinTimeoutSeconds, kMaxTimeoutSeconds,
                               &config->timeout_seconds);
         }
     }
     fclose(file);
+
+    if (config->retry_max_seconds < config->retry_seconds) {
+        config->retry_max_seconds = config->retry_seconds;
+    }
 
     // LAN HTTP avoids TLS initialization cost and certificate compatibility issues.
     if (strncmp(config->url, "http://", 7) != 0 || config->url[7] == '\0') {
@@ -533,10 +562,15 @@ static void draw_diagnostics() {
     int y = panel_y + margin;
     char now[32];
     char updated[32];
+    char checked[32];
+    char last_success[32];
     char line[64];
 
     format_diagnostic_time(time(NULL), now, sizeof(now));
     format_diagnostic_time(last_image_update_time, updated, sizeof(updated));
+    format_diagnostic_time(last_network_attempt_time, checked, sizeof(checked));
+    format_diagnostic_time(last_network_success_time, last_success,
+                           sizeof(last_success));
 
     FillArea(panel_x, panel_y, panel_width, panel_height, WHITE);
     DrawRect(panel_x, panel_y, panel_width - 1, panel_height - 1, BLACK);
@@ -551,6 +585,26 @@ static void draw_diagnostics() {
     DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
     y += line_height;
     snprintf(line, sizeof(line), "Battery: %d%%", GetBatteryPower());
+    DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
+    y += line_height;
+    snprintf(line, sizeof(line), "Checked: %s", checked);
+    DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
+    y += line_height;
+    snprintf(line, sizeof(line), "Last OK: %s", last_success);
+    DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
+    y += line_height;
+    snprintf(line, sizeof(line), "Network: %s, %ds",
+             last_network_attempt_time == 0 ? "none" :
+             (last_network_succeeded ? "OK" : "failed"),
+             last_network_duration_seconds);
+    DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
+    y += line_height;
+    snprintf(line, sizeof(line), "Checks: %d OK, %d failed",
+             successful_network_checks, failed_network_checks);
+    DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
+    y += line_height;
+    snprintf(line, sizeof(line), "Failures in row: %d",
+             consecutive_network_failures);
     DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
 
     // The dialog is only black and white, so the low-energy E-Ink update is enough.
@@ -581,6 +635,7 @@ static bool refresh_remote_picture_now() {
     remote_config = loaded_config;
     remote_next_poll_seconds = remote_config.refresh_seconds;
     remote_retry_seconds = remote_config.retry_seconds;
+    remote_retry_max_seconds = remote_config.retry_max_seconds;
 
     if ((QueryNetwork() & NET_CONNECTED) == 0) {
         // Passing NULL asks InkView to use the already configured default Wi-Fi.
@@ -671,9 +726,45 @@ static void refresh_remote_picture() {
     if (!remote_mode || diagnostics_visible) {
         return;
     }
+    remote_refresh_scheduled = false;
+    time_t started = time(NULL);
+    last_network_attempt_time = started;
     bool success = refresh_remote_picture_now();
-    int delay_seconds = success ? remote_next_poll_seconds : remote_retry_seconds;
-    schedule_remote_refresh(delay_seconds * 1000);
+    time_t finished = time(NULL);
+    last_network_duration_seconds =
+        finished > started ? static_cast<int>(finished - started) : 0;
+    last_network_succeeded = success;
+
+    if (success) {
+        ++successful_network_checks;
+        consecutive_network_failures = 0;
+        last_network_success_time = finished;
+        if (remote_config.automatic_refresh) {
+            schedule_remote_refresh(remote_next_poll_seconds * 1000);
+        }
+        return;
+    }
+
+    ++failed_network_checks;
+    ++consecutive_network_failures;
+    int delay_seconds = remote_retry_seconds;
+    for (int attempt = 1; attempt < consecutive_network_failures;
+         ++attempt) {
+        if (delay_seconds >= remote_retry_max_seconds / 2) {
+            delay_seconds = remote_retry_max_seconds;
+            break;
+        }
+        delay_seconds *= 2;
+    }
+    if (delay_seconds > remote_retry_max_seconds) {
+        delay_seconds = remote_retry_max_seconds;
+    }
+
+    // With a cached frame, battery saver waits for foreground or a manual
+    // request. It still retries an empty frame so first setup can recover.
+    if (remote_config.automatic_refresh || !is_regular_file(REMOTE_CACHE_PATH)) {
+        schedule_remote_refresh(delay_seconds * 1000);
+    }
 }
 
 static void schedule_next_picture(int ms) {
@@ -726,7 +817,8 @@ static void repaint_current_picture() {
         } else if (!diagnostics_visible) {
             schedule_remote_refresh(100);
         }
-        if (!diagnostics_visible && !remote_refresh_scheduled) {
+        if (!diagnostics_visible && remote_config.automatic_refresh &&
+            !remote_refresh_scheduled) {
             schedule_remote_refresh(remote_config.refresh_seconds * 1000);
         }
         if (diagnostics_visible) {

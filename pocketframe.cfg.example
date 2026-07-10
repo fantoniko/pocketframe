@@ -9,8 +9,15 @@ manifest_url=http://192.168.1.50:8080/manifest?token=replace-with-your-token
 # The default is 60 minutes. Minimum: 5 minutes.
 interval_minutes=60
 
-# Used when Wi-Fi or the server cannot be reached. Minimum: 5 minutes.
+# The default preserves battery: after a successful refresh it waits for a
+# foreground return or the Right/Next/OK button. Set always_on for timed checks.
+refresh_mode=battery_saver
+
+# Initial retry delay when Wi-Fi or the server cannot be reached. Minimum: 5 min.
 retry_minutes=30
+
+# Failed retries double until this limit. Minimum: 5 minutes.
+retry_max_minutes=240
 
 # Each request is aborted after this period. Range: 5-60 seconds.
 timeout_seconds=15

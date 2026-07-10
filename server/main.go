@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
@@ -19,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	xdraw "golang.org/x/image/draw"
 )
@@ -39,7 +41,19 @@ type config struct {
 }
 
 type metadata struct {
-	revision string
+	revision   string
+	updatedAt  time.Time
+	frameBytes int64
+}
+
+type statusResponse struct {
+	Ready           bool   `json:"ready"`
+	Revision        string `json:"revision,omitempty"`
+	UpdatedAt       string `json:"updated_at,omitempty"`
+	FrameBytes      int64  `json:"frame_bytes,omitempty"`
+	TargetWidth     int    `json:"target_width"`
+	TargetHeight    int    `json:"target_height"`
+	NextPollSeconds int    `json:"next_poll_seconds"`
 }
 
 type server struct {
@@ -63,6 +77,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", server.health)
 	mux.HandleFunc("GET /manifest", server.manifest)
+	mux.HandleFunc("GET /status", server.status)
 	mux.HandleFunc("GET /frame.jpg", server.frame)
 	mux.HandleFunc("POST /api/frame", server.upload)
 
@@ -171,6 +186,34 @@ func (s *server) frame(writer http.ResponseWriter, request *http.Request) {
 	http.ServeFile(writer, request, s.config.framePath)
 }
 
+func (s *server) status(writer http.ResponseWriter, request *http.Request) {
+	if !s.authorized(writer, request) {
+		return
+	}
+
+	s.mu.RLock()
+	meta := s.meta
+	s.mu.RUnlock()
+	response := statusResponse{
+		Ready:           meta.revision != "",
+		TargetWidth:     targetWidth,
+		TargetHeight:    targetHeight,
+		NextPollSeconds: s.config.nextPollSeconds,
+	}
+	if response.Ready {
+		response.Revision = meta.revision
+		response.UpdatedAt = meta.updatedAt.UTC().Format(time.RFC3339)
+		response.FrameBytes = meta.frameBytes
+	}
+
+	writer.Header().Set("Cache-Control", "no-store")
+	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if !response.Ready {
+		writer.WriteHeader(http.StatusServiceUnavailable)
+	}
+	json.NewEncoder(writer).Encode(response)
+}
+
 func (s *server) upload(writer http.ResponseWriter, request *http.Request) {
 	if !s.authorized(writer, request) {
 		return
@@ -221,8 +264,12 @@ func (s *server) loadExistingFrame() error {
 	if err != nil {
 		return err
 	}
+	info, err := os.Stat(s.config.framePath)
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
-	s.meta = metadata{revision: revision(data)}
+	s.meta = metadata{revision: revision(data), updatedAt: info.ModTime(), frameBytes: info.Size()}
 	s.mu.Unlock()
 	return nil
 }
@@ -266,7 +313,15 @@ func (s *server) publish(encoded []byte) (metadata, error) {
 		return metadata{}, fmt.Errorf("publish JPEG: %w", err)
 	}
 
-	meta := metadata{revision: hex.EncodeToString(hasher.Sum(nil))}
+	info, err := os.Stat(s.config.framePath)
+	if err != nil {
+		return metadata{}, fmt.Errorf("stat published JPEG: %w", err)
+	}
+	meta := metadata{
+		revision:   hex.EncodeToString(hasher.Sum(nil)),
+		updatedAt:  info.ModTime(),
+		frameBytes: info.Size(),
+	}
 	s.mu.Lock()
 	s.meta = meta
 	s.mu.Unlock()

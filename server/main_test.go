@@ -5,9 +5,12 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestPrepareProducesPocketBookGrayscale(t *testing.T) {
@@ -116,5 +119,31 @@ func TestIsSupportedImage(t *testing.T) {
 	}
 	if isSupportedImage("image/webp") {
 		t.Fatal("unexpected WebP support")
+	}
+}
+
+func TestStatusRequiresTokenAndReturnsFrameMetadata(t *testing.T) {
+	updated := time.Date(2026, time.July, 10, 12, 0, 0, 0, time.UTC)
+	server := &server{
+		config: config{token: "0123456789abcdef", nextPollSeconds: 3600},
+		meta:   metadata{revision: "abc123", updatedAt: updated, frameBytes: 4567},
+	}
+
+	unauthorized := httptest.NewRecorder()
+	server.status(unauthorized, httptest.NewRequest(http.MethodGet, "/status", nil))
+	if unauthorized.Code != http.StatusNotFound {
+		t.Fatalf("unauthorized status = %d, want %d", unauthorized.Code, http.StatusNotFound)
+	}
+
+	response := httptest.NewRecorder()
+	server.status(response, httptest.NewRequest(http.MethodGet, "/status?token=0123456789abcdef", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
+	}
+	if got, want := response.Body.String(), "\"ready\":true"; !bytes.Contains([]byte(got), []byte(want)) {
+		t.Fatalf("status body = %s, want %s", got, want)
+	}
+	if got, want := response.Body.String(), "\"frame_bytes\":4567"; !bytes.Contains([]byte(got), []byte(want)) {
+		t.Fatalf("status body = %s, want %s", got, want)
 	}
 }
