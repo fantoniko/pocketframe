@@ -25,6 +25,7 @@ url=http://192.168.1.50:8080/frame.jpg?token=replace-with-read-token
 manifest_url=http://192.168.1.50:8080/manifest?token=replace-with-read-token
 interval_minutes=60
 refresh_mode=battery_saver
+wake_min_battery_percent=20
 retry_minutes=30
 retry_max_minutes=240
 timeout_seconds=15
@@ -55,6 +56,20 @@ when Right, Page Forward, or OK is pressed. It does not continue timed polling
 after a successful check. If no cached frame exists, failed first-time setup
 continues with exponential retries. Set `refresh_mode=always_on` to schedule
 automatic checks using `interval_minutes`; keep PocketBook awake for that mode.
+
+`refresh_mode=scheduled_sleep` is an experimental low-power automatic mode for
+PocketBook 740 firmware `U740.6.5.1379`. After each network check it disconnects
+Wi-Fi, lets the E-Ink update settle, suspends with an RTC deadline, and checks
+the server again after wakeup. The manifest's `next_poll_seconds` controls the
+successful interval; errors use the same exponential backoff. At or below
+`wake_min_battery_percent` (20% by default), network wakeups pause and the app
+sleeps for 24 hours at a time unless the device is charging. Three immediate
+`GoSleep` failures disable scheduled wakeups for the current app session.
+
+Scheduled sleep requires `Lock Device after = Off` and `Auto Power Off = Off`:
+PocketFrame performs suspend itself, while the system lock would move the app to
+the background and stop its cycle. Right/Page Forward still forces an immediate
+check, Menu interrupts sleep and shows diagnostics, and Home exits normally.
 
 Use a fixed LAN IPv4 address where possible. The service should return
 `Cache-Control: no-store`. PocketFrame deliberately accepts only plain
@@ -119,9 +134,11 @@ curl.exe "http://127.0.0.1:8080/status?token=$readToken"
 ```
 
 It returns JSON with readiness, revision, publication time, prepared JPEG size,
-target dimensions, and the server's requested polling interval. Uploads are
-limited both by encoded size and source pixel count; the defaults are 15 MB and
-25 megapixels.
+target dimensions, the server's requested polling interval, and RAM-only
+manifest/frame request counters with their latest timestamps. These counters
+reset when the container restarts and make scheduled wakeups observable without
+touching the PocketBook. Uploads are limited both by encoded size and source
+pixel count; the defaults are 15 MB and 25 megapixels.
 
 For battery life, the default mode avoids timed polling. Each request connects
 only for the request and disconnects immediately afterwards, writes the flash
@@ -135,7 +152,8 @@ screen if Wi-Fi or the service is unavailable.
   mode. The screen changes only if the server returns a new revision.
 * Menu (the three-line button) toggles a centered diagnostic window with the
   current time, image-update time, last network attempt/result/duration, and
-  success/failure counters.
+  success/failure counters. Scheduled mode also shows the next RTC deadline,
+  last sleep duration/result, inferred wake source, and sleep guard state.
 
 The diagnostic window uses only a black-and-white partial E-Ink update. While it
 is open, the slideshow and network timers are paused; closing it redraws the
@@ -207,9 +225,18 @@ are paused during sleep; when the device returns to PocketFrame, it immediately
 checks the server again. The right-arrow button can always request a manual
 refresh while the app is open.
 
-Automatic updates all night require the device to stay awake and will consume
-substantially more battery. PocketFrame disconnects Wi-Fi immediately after
-every request.
+Automatic updates all night with `always_on` require the device to stay awake
+and will consume substantially more battery. PocketFrame disconnects Wi-Fi
+immediately after every request.
+
+For automatic updates with the CPU suspended between checks, use the explicitly
+enabled `scheduled_sleep` mode described above. Start with a five-minute server
+poll interval for 30-60 minutes, then use 60 minutes for an overnight battery
+test before relying on it continuously. For the first test set
+`POCKETFRAME_NEXT_POLL_SECONDS=300` and
+`POCKETFRAME_RETRY_AFTER_SECONDS=300` in Portainer. Each RTC cycle increments
+`manifest_requests` in `/status`; `frame_requests` increments only when a new
+revision requires downloading the JPEG.
 
 ### Experimental scheduled wakeup probe
 

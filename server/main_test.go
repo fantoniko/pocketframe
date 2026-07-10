@@ -139,8 +139,12 @@ func TestIsSupportedImage(t *testing.T) {
 func TestStatusRequiresTokenAndReturnsFrameMetadata(t *testing.T) {
 	updated := time.Date(2026, time.July, 10, 12, 0, 0, 0, time.UTC)
 	server := &server{
-		config: config{readToken: testToken, nextPollSeconds: 3600},
-		meta:   metadata{revision: "abc123", updatedAt: updated, frameBytes: 4567},
+		config:                config{readToken: testToken, nextPollSeconds: 3600},
+		meta:                  metadata{revision: "abc123", updatedAt: updated, frameBytes: 4567},
+		manifestRequests:      7,
+		lastManifestRequestAt: updated,
+		frameRequests:         3,
+		lastFrameRequestAt:    updated,
 	}
 
 	unauthorized := httptest.NewRecorder()
@@ -159,6 +163,39 @@ func TestStatusRequiresTokenAndReturnsFrameMetadata(t *testing.T) {
 	}
 	if got, want := response.Body.String(), "\"frame_bytes\":4567"; !bytes.Contains([]byte(got), []byte(want)) {
 		t.Fatalf("status body = %s, want %s", got, want)
+	}
+	if got, want := response.Body.String(), "\"manifest_requests\":7"; !bytes.Contains([]byte(got), []byte(want)) {
+		t.Fatalf("status body = %s, want %s", got, want)
+	}
+	if got, want := response.Body.String(), "\"frame_requests\":3"; !bytes.Contains([]byte(got), []byte(want)) {
+		t.Fatalf("status body = %s, want %s", got, want)
+	}
+}
+
+func TestManifestAndFrameUpdateRequestMetrics(t *testing.T) {
+	directory := t.TempDir()
+	server := &server{
+		config: testConfig(filepath.Join(directory, "frame.jpg")),
+		meta:   metadata{revision: "abc123", updatedAt: time.Now(), frameBytes: 4},
+	}
+	if err := os.WriteFile(server.config.framePath, []byte("jpeg"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	manifestResponse := httptest.NewRecorder()
+	server.manifest(manifestResponse,
+		httptest.NewRequest(http.MethodGet, "/manifest?token="+testToken, nil))
+	frameResponse := httptest.NewRecorder()
+	server.frame(frameResponse,
+		httptest.NewRequest(http.MethodGet, "/frame.jpg?token="+testToken, nil))
+
+	server.mu.RLock()
+	defer server.mu.RUnlock()
+	if server.manifestRequests != 1 || server.lastManifestRequestAt.IsZero() {
+		t.Fatalf("manifest metrics = %d, %v", server.manifestRequests, server.lastManifestRequestAt)
+	}
+	if server.frameRequests != 1 || server.lastFrameRequestAt.IsZero() {
+		t.Fatalf("frame metrics = %d, %v", server.frameRequests, server.lastFrameRequestAt)
 	}
 }
 

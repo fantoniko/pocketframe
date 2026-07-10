@@ -10,8 +10,13 @@ manifest_url=http://192.168.1.50:8080/manifest?token=replace-with-your-token
 interval_minutes=60
 
 # The default preserves battery: after a successful refresh it waits for a
-# foreground return or the Right/Next/OK button. Set always_on for timed checks.
+# foreground return or the Right/Next/OK button. Use scheduled_sleep for
+# experimental RTC wakeups, or always_on to keep the process awake.
 refresh_mode=battery_saver
+
+# In scheduled_sleep mode, automatic network wakeups pause at or below this
+# battery level unless the device is charging. Range: 0-100; 0 disables it.
+wake_min_battery_percent=20
 
 # Initial retry delay when Wi-Fi or the server cannot be reached. Minimum: 5 min.
 retry_minutes=30

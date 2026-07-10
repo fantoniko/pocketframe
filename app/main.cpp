@@ -23,6 +23,11 @@ static const int kMaxPollSeconds = 24 * 60 * 60;
 static const int kDefaultTimeoutSeconds = 15;
 static const int kMinTimeoutSeconds = 5;
 static const int kMaxTimeoutSeconds = 60;
+static const int kDefaultWakeMinBatteryPercent = 20;
+static const int kSleepSettleMilliseconds = 2000;
+static const int kWakeSettleMilliseconds = 1000;
+static const int kImmediateSleepFailureSeconds = 3;
+static const int kMaxImmediateSleepFailures = 3;
 static const char *REMOTE_CONFIG_PATH =
     "/mnt/ext1/system/config/pocketframe.cfg";
 static const char *REMOTE_CACHE_PATH =
@@ -43,6 +48,12 @@ static const int kMaxPath = 512;
 static const int kConfigLineSize = 768;
 static const int kMaxRevisionSize = 256;
 
+enum RefreshMode {
+    REFRESH_BATTERY_SAVER,
+    REFRESH_ALWAYS_ON,
+    REFRESH_SCHEDULED_SLEEP,
+};
+
 struct RemoteConfig {
     char url[kConfigLineSize];
     char manifest_url[kConfigLineSize];
@@ -50,7 +61,8 @@ struct RemoteConfig {
     int retry_seconds;
     int retry_max_seconds;
     int timeout_seconds;
-    bool automatic_refresh;
+    int wake_min_battery_percent;
+    RefreshMode refresh_mode;
 };
 
 struct RemoteManifest {
@@ -81,9 +93,22 @@ static int failed_network_checks = 0;
 static int consecutive_network_failures = 0;
 static bool last_network_succeeded = false;
 static bool diagnostics_visible = false;
+static bool scheduled_sleep_disabled = false;
+static bool scheduled_sleep_low_battery = false;
+static int pending_sleep_seconds = 0;
+static int immediate_sleep_failures = 0;
+static int last_sleep_result = 0;
+static int last_sleep_elapsed_seconds = 0;
+static time_t last_sleep_started_time = 0;
+static time_t last_sleep_finished_time = 0;
+static time_t next_wake_time = 0;
+static bool last_wake_likely_rtc = false;
+static bool suppress_next_repaint = false;
 
 static void show_next_picture();
 static void refresh_remote_picture();
+static void enter_scheduled_sleep();
+static void release_network();
 static void draw_diagnostics();
 static void repaint_current_picture();
 
@@ -287,7 +312,8 @@ static bool load_remote_config(RemoteConfig *config) {
     config->retry_seconds = kDefaultRetrySeconds;
     config->retry_max_seconds = kDefaultRetryMaxSeconds;
     config->timeout_seconds = kDefaultTimeoutSeconds;
-    config->automatic_refresh = false;
+    config->wake_min_battery_percent = kDefaultWakeMinBatteryPercent;
+    config->refresh_mode = REFRESH_BATTERY_SAVER;
 
     FILE *file = fopen(REMOTE_CONFIG_PATH, "r");
     if (file == NULL) {
@@ -337,10 +363,15 @@ static bool load_remote_config(RemoteConfig *config) {
             }
         } else if (strcmp(key, "refresh_mode") == 0) {
             if (strcmp(value, "always_on") == 0) {
-                config->automatic_refresh = true;
+                config->refresh_mode = REFRESH_ALWAYS_ON;
+            } else if (strcmp(value, "scheduled_sleep") == 0) {
+                config->refresh_mode = REFRESH_SCHEDULED_SLEEP;
             } else if (strcmp(value, "battery_saver") == 0) {
-                config->automatic_refresh = false;
+                config->refresh_mode = REFRESH_BATTERY_SAVER;
             }
+        } else if (strcmp(key, "wake_min_battery_percent") == 0) {
+            parse_limited_int(value, 0, 100,
+                              &config->wake_min_battery_percent);
         } else if (strcmp(key, "timeout_seconds") == 0) {
             parse_limited_int(value, kMinTimeoutSeconds, kMaxTimeoutSeconds,
                               &config->timeout_seconds);
@@ -541,6 +572,101 @@ static void clear_remote_refresh() {
     remote_refresh_scheduled = false;
 }
 
+static const char *refresh_mode_name(RefreshMode mode) {
+    if (mode == REFRESH_ALWAYS_ON) {
+        return "always_on";
+    }
+    if (mode == REFRESH_SCHEDULED_SLEEP) {
+        return "scheduled_sleep";
+    }
+    return "battery_saver";
+}
+
+static bool battery_is_below_wake_threshold() {
+    return remote_config.wake_min_battery_percent > 0 && !IsCharging() &&
+           GetBatteryPower() <= remote_config.wake_min_battery_percent;
+}
+
+static void clear_scheduled_sleep() {
+    ClearTimer(enter_scheduled_sleep);
+    pending_sleep_seconds = 0;
+    next_wake_time = 0;
+    iv_sleepmode(0);
+}
+
+static void schedule_scheduled_sleep(int delay_seconds) {
+    ClearTimer(enter_scheduled_sleep);
+    if (!remote_mode || diagnostics_visible ||
+        remote_config.refresh_mode != REFRESH_SCHEDULED_SLEEP) {
+        return;
+    }
+    if (scheduled_sleep_disabled) {
+        iv_sleepmode(1);
+        return;
+    }
+
+    scheduled_sleep_low_battery = battery_is_below_wake_threshold();
+    if (scheduled_sleep_low_battery) {
+        delay_seconds = kMaxPollSeconds;
+    }
+    if (delay_seconds < kMinRefreshSeconds) {
+        delay_seconds = kMinRefreshSeconds;
+    }
+    if (delay_seconds > kMaxPollSeconds) {
+        delay_seconds = kMaxPollSeconds;
+    }
+
+    pending_sleep_seconds = delay_seconds;
+    next_wake_time = time(NULL) + delay_seconds +
+                     (kSleepSettleMilliseconds + 999) / 1000;
+    SetWeakTimer("PocketFrameSleep", enter_scheduled_sleep,
+                 kSleepSettleMilliseconds);
+}
+
+static void enter_scheduled_sleep() {
+    if (!remote_mode || diagnostics_visible || scheduled_sleep_disabled ||
+        remote_config.refresh_mode != REFRESH_SCHEDULED_SLEEP ||
+        pending_sleep_seconds <= 0) {
+        return;
+    }
+
+    int requested_seconds = pending_sleep_seconds;
+    release_network();
+    last_sleep_started_time = time(NULL);
+    next_wake_time = last_sleep_started_time + requested_seconds;
+    iv_sleepmode(1);
+    last_sleep_result = GoSleep(requested_seconds * 1000, 0);
+    iv_sleepmode(0);
+    last_sleep_finished_time = time(NULL);
+    last_sleep_elapsed_seconds = static_cast<int>(
+        last_sleep_finished_time - last_sleep_started_time);
+    last_wake_likely_rtc =
+        last_sleep_elapsed_seconds >= requested_seconds - 5;
+    suppress_next_repaint = true;
+    pending_sleep_seconds = 0;
+    next_wake_time = 0;
+
+    if (last_sleep_elapsed_seconds < kImmediateSleepFailureSeconds) {
+        suppress_next_repaint = false;
+        ++immediate_sleep_failures;
+        if (immediate_sleep_failures >= kMaxImmediateSleepFailures) {
+            scheduled_sleep_disabled = true;
+            iv_sleepmode(1);
+        } else {
+            schedule_scheduled_sleep(requested_seconds);
+        }
+        return;
+    }
+    immediate_sleep_failures = 0;
+
+    if (scheduled_sleep_low_battery && last_wake_likely_rtc &&
+        battery_is_below_wake_threshold()) {
+        schedule_scheduled_sleep(kMaxPollSeconds);
+        return;
+    }
+    schedule_remote_refresh(kWakeSettleMilliseconds);
+}
+
 static void format_diagnostic_time(time_t value, char *text, size_t text_size) {
     if (value <= 0) {
         snprintf(text, text_size, "not available");
@@ -566,6 +692,7 @@ static void draw_diagnostics() {
     char updated[32];
     char checked[32];
     char last_success[32];
+    char wake[32];
     char line[64];
 
     format_diagnostic_time(time(NULL), now, sizeof(now));
@@ -573,6 +700,7 @@ static void draw_diagnostics() {
     format_diagnostic_time(last_network_attempt_time, checked, sizeof(checked));
     format_diagnostic_time(last_network_success_time, last_success,
                            sizeof(last_success));
+    format_diagnostic_time(next_wake_time, wake, sizeof(wake));
 
     FillArea(panel_x, panel_y, panel_width, panel_height, WHITE);
     DrawRect(panel_x, panel_y, panel_width - 1, panel_height - 1, BLACK);
@@ -587,6 +715,13 @@ static void draw_diagnostics() {
     DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
     y += line_height;
     snprintf(line, sizeof(line), "Battery: %d%%", GetBatteryPower());
+    DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
+    y += line_height;
+    snprintf(line, sizeof(line), "Mode: %s",
+             refresh_mode_name(remote_config.refresh_mode));
+    DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
+    y += line_height;
+    snprintf(line, sizeof(line), "Next wake: %s", wake);
     DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
     y += line_height;
     snprintf(line, sizeof(line), "Checked: %s", checked);
@@ -608,6 +743,17 @@ static void draw_diagnostics() {
     snprintf(line, sizeof(line), "Failures in row: %d",
              consecutive_network_failures);
     DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
+    y += line_height;
+    snprintf(line, sizeof(line), "Sleep: %ds rc=%d %s",
+             last_sleep_elapsed_seconds, last_sleep_result,
+             last_sleep_started_time == 0 ? "none" :
+             (last_wake_likely_rtc ? "RTC" : "manual"));
+    DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
+    y += line_height;
+    snprintf(line, sizeof(line), "Sleep guard: %s, battery: %s",
+             scheduled_sleep_disabled ? "disabled" : "OK",
+             scheduled_sleep_low_battery ? "low" : "OK");
+    DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
 
     // The dialog is only black and white, so the low-energy E-Ink update is enough.
     PartialUpdateBW(panel_x, panel_y, panel_width, panel_height);
@@ -616,6 +762,7 @@ static void draw_diagnostics() {
 static void open_diagnostics() {
     ClearTimer(show_next_picture);
     clear_remote_refresh();
+    clear_scheduled_sleep();
     diagnostics_visible = true;
     draw_diagnostics();
 }
@@ -623,6 +770,11 @@ static void open_diagnostics() {
 static void close_diagnostics() {
     diagnostics_visible = false;
     repaint_current_picture();
+    if (remote_mode &&
+        remote_config.refresh_mode == REFRESH_SCHEDULED_SLEEP) {
+        clear_remote_refresh();
+        schedule_remote_refresh(100);
+    }
 }
 
 static void release_network() {
@@ -635,6 +787,9 @@ static bool refresh_remote_picture_now() {
         return false;
     }
     remote_config = loaded_config;
+    if (remote_config.refresh_mode != REFRESH_SCHEDULED_SLEEP) {
+        iv_sleepmode(0);
+    }
     remote_next_poll_seconds = remote_config.refresh_seconds;
     remote_retry_seconds = remote_config.retry_seconds;
     remote_retry_max_seconds = remote_config.retry_max_seconds;
@@ -735,6 +890,7 @@ static void refresh_remote_picture() {
         return;
     }
     remote_refresh_scheduled = false;
+    suppress_next_repaint = false;
     time_t started = time(NULL);
     last_network_attempt_time = started;
     bool success = refresh_remote_picture_now();
@@ -747,8 +903,10 @@ static void refresh_remote_picture() {
         ++successful_network_checks;
         consecutive_network_failures = 0;
         last_network_success_time = finished;
-        if (remote_config.automatic_refresh) {
+        if (remote_config.refresh_mode == REFRESH_ALWAYS_ON) {
             schedule_remote_refresh(remote_next_poll_seconds * 1000);
+        } else if (remote_config.refresh_mode == REFRESH_SCHEDULED_SLEEP) {
+            schedule_scheduled_sleep(remote_next_poll_seconds);
         }
         return;
     }
@@ -770,7 +928,10 @@ static void refresh_remote_picture() {
 
     // With a cached frame, battery saver waits for foreground or a manual
     // request. It still retries an empty frame so first setup can recover.
-    if (remote_config.automatic_refresh || !is_regular_file(REMOTE_CACHE_PATH)) {
+    if (remote_config.refresh_mode == REFRESH_SCHEDULED_SLEEP) {
+        schedule_scheduled_sleep(delay_seconds);
+    } else if (remote_config.refresh_mode == REFRESH_ALWAYS_ON ||
+               !is_regular_file(REMOTE_CACHE_PATH)) {
         schedule_remote_refresh(delay_seconds * 1000);
     }
 }
@@ -825,7 +986,8 @@ static void repaint_current_picture() {
         } else if (!diagnostics_visible) {
             schedule_remote_refresh(100);
         }
-        if (!diagnostics_visible && remote_config.automatic_refresh &&
+        if (!diagnostics_visible &&
+            remote_config.refresh_mode == REFRESH_ALWAYS_ON &&
             !remote_refresh_scheduled) {
             schedule_remote_refresh(remote_config.refresh_seconds * 1000);
         }
@@ -881,9 +1043,18 @@ static int main_handler(int event_type, int param_one, int param_two) {
         current_picture_name[0] = '\0';
         show_next_picture();
     } else if (EVT_SHOW == event_type || EVT_REPAINT == event_type) {
-        repaint_current_picture();
+        if (suppress_next_repaint) {
+            suppress_next_repaint = false;
+        } else {
+            repaint_current_picture();
+        }
     } else if (EVT_FOREGROUND == event_type || EVT_ACTIVATE == event_type) {
-        repaint_current_picture();
+        clear_scheduled_sleep();
+        if (suppress_next_repaint) {
+            suppress_next_repaint = false;
+        } else {
+            repaint_current_picture();
+        }
         if (remote_mode && !diagnostics_visible) {
             clear_remote_refresh();
             schedule_remote_refresh(100);
@@ -891,10 +1062,12 @@ static int main_handler(int event_type, int param_one, int param_two) {
     } else if (EVT_HIDE == event_type || EVT_BACKGROUND == event_type) {
         ClearTimer(show_next_picture);
         clear_remote_refresh();
+        clear_scheduled_sleep();
         release_network();
     } else if (EVT_EXIT == event_type) {
         ClearTimer(show_next_picture);
         clear_remote_refresh();
+        clear_scheduled_sleep();
         CloseFont(font);
     } else if (EVT_KEYPRESS == event_type) {
         if (param_one == KEY_MENU) {
@@ -910,6 +1083,7 @@ static int main_handler(int event_type, int param_one, int param_two) {
                 close_diagnostics();
             }
             clear_remote_refresh();
+            clear_scheduled_sleep();
             schedule_remote_refresh(100);
         } else if (param_one == KEY_BACK || param_one == KEY_HOME) {
             CloseApp();

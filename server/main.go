@@ -54,21 +54,29 @@ type metadata struct {
 }
 
 type statusResponse struct {
-	Ready           bool   `json:"ready"`
-	Revision        string `json:"revision,omitempty"`
-	UpdatedAt       string `json:"updated_at,omitempty"`
-	FrameBytes      int64  `json:"frame_bytes,omitempty"`
-	TargetWidth     int    `json:"target_width"`
-	TargetHeight    int    `json:"target_height"`
-	NextPollSeconds int    `json:"next_poll_seconds"`
+	Ready                 bool   `json:"ready"`
+	Revision              string `json:"revision,omitempty"`
+	UpdatedAt             string `json:"updated_at,omitempty"`
+	FrameBytes            int64  `json:"frame_bytes,omitempty"`
+	TargetWidth           int    `json:"target_width"`
+	TargetHeight          int    `json:"target_height"`
+	NextPollSeconds       int    `json:"next_poll_seconds"`
+	ManifestRequests      uint64 `json:"manifest_requests"`
+	LastManifestRequestAt string `json:"last_manifest_request_at,omitempty"`
+	FrameRequests         uint64 `json:"frame_requests"`
+	LastFrameRequestAt    string `json:"last_frame_request_at,omitempty"`
 }
 
 type server struct {
-	config    config
-	mu        sync.RWMutex
-	uploadMu  sync.Mutex
-	publishMu sync.Mutex
-	meta      metadata
+	config                config
+	mu                    sync.RWMutex
+	uploadMu              sync.Mutex
+	publishMu             sync.Mutex
+	meta                  metadata
+	manifestRequests      uint64
+	lastManifestRequestAt time.Time
+	frameRequests         uint64
+	lastFrameRequestAt    time.Time
 }
 
 func main() {
@@ -234,9 +242,11 @@ func (s *server) manifest(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	s.mu.RLock()
+	s.mu.Lock()
+	s.manifestRequests++
+	s.lastManifestRequestAt = time.Now().UTC()
 	meta := s.meta
-	s.mu.RUnlock()
+	s.mu.Unlock()
 	if meta.revision == "" {
 		http.Error(writer, "frame is not ready", http.StatusServiceUnavailable)
 		return
@@ -250,9 +260,11 @@ func (s *server) frame(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	s.mu.RLock()
+	s.mu.Lock()
+	s.frameRequests++
+	s.lastFrameRequestAt = time.Now().UTC()
 	ready := s.meta.revision != ""
-	s.mu.RUnlock()
+	s.mu.Unlock()
 	if !ready {
 		http.Error(writer, "frame is not ready", http.StatusServiceUnavailable)
 		return
@@ -270,12 +282,24 @@ func (s *server) status(writer http.ResponseWriter, request *http.Request) {
 
 	s.mu.RLock()
 	meta := s.meta
+	manifestRequests := s.manifestRequests
+	lastManifestRequestAt := s.lastManifestRequestAt
+	frameRequests := s.frameRequests
+	lastFrameRequestAt := s.lastFrameRequestAt
 	s.mu.RUnlock()
 	response := statusResponse{
-		Ready:           meta.revision != "",
-		TargetWidth:     targetWidth,
-		TargetHeight:    targetHeight,
-		NextPollSeconds: s.config.nextPollSeconds,
+		Ready:            meta.revision != "",
+		TargetWidth:      targetWidth,
+		TargetHeight:     targetHeight,
+		NextPollSeconds:  s.config.nextPollSeconds,
+		ManifestRequests: manifestRequests,
+		FrameRequests:    frameRequests,
+	}
+	if !lastManifestRequestAt.IsZero() {
+		response.LastManifestRequestAt = lastManifestRequestAt.Format(time.RFC3339)
+	}
+	if !lastFrameRequestAt.IsZero() {
+		response.LastFrameRequestAt = lastFrameRequestAt.Format(time.RFC3339)
 	}
 	if response.Ready {
 		response.Revision = meta.revision
