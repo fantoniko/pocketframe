@@ -170,7 +170,15 @@ For PocketBook 740 / InkPad 3, use 1404x1872 portrait images for the sharpest fu
 The app scales JPEG images to fit the screen and centers them without cropping.
 SDK `Stretch` can resize photos of other dimensions as well.
 
-To prevent turning device off, disable power saving features.
+### Battery saver mode
 
-  * Settings / Saving Power -> Lock Device after = Off
-  * Settings / Saving Power -> Power off after = Off
+For the longest battery life, keep the normal PocketBook power-saving settings
+enabled, for example `Lock Device after = 5 or 10 min`. The displayed E-Ink frame
+remains visible while locked and consumes almost no display power. Network timers
+are paused during sleep; when the device returns to PocketFrame, it immediately
+checks the server again. The right-arrow button can always request a manual
+refresh while the app is open.
+
+Automatic updates all night require the device to stay awake and will consume
+substantially more battery. PocketFrame disconnects Wi-Fi immediately after
+every request.

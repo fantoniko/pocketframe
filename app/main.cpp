@@ -569,6 +569,10 @@ static void close_diagnostics() {
     repaint_current_picture();
 }
 
+static void release_network() {
+    NetDisconnect();
+}
+
 static bool refresh_remote_picture_now() {
     RemoteConfig loaded_config;
     if (!load_remote_config(&loaded_config)) {
@@ -578,13 +582,12 @@ static bool refresh_remote_picture_now() {
     remote_next_poll_seconds = remote_config.refresh_seconds;
     remote_retry_seconds = remote_config.retry_seconds;
 
-    bool connected_by_app = false;
     if ((QueryNetwork() & NET_CONNECTED) == 0) {
         // Passing NULL asks InkView to use the already configured default Wi-Fi.
         if (NetConnect(NULL) != NET_OK) {
+            release_network();
             return false;
         }
-        connected_by_app = true;
     }
 
     RemoteManifest manifest;
@@ -592,9 +595,7 @@ static bool refresh_remote_picture_now() {
     bool use_manifest = remote_config.manifest_url[0] != '\0';
     if (use_manifest) {
         if (!download_manifest(&manifest)) {
-            if (connected_by_app) {
-                NetDisconnect();
-            }
+            release_network();
             return false;
         }
         if (manifest.next_poll_seconds > 0) {
@@ -605,9 +606,7 @@ static bool refresh_remote_picture_now() {
         }
         if (have_remote_revision &&
             strcmp(manifest.revision, remote_revision) == 0) {
-            if (connected_by_app) {
-                NetDisconnect();
-            }
+            release_network();
             return true;
         }
     }
@@ -615,9 +614,7 @@ static bool refresh_remote_picture_now() {
     int received_size = 0;
     void *received = QuickDownloadExt(remote_config.url, &received_size,
                                       remote_config.timeout_seconds, NULL, NULL);
-    if (connected_by_app) {
-        NetDisconnect();
-    }
+    release_network();
 
     if (received == NULL || !looks_like_jpeg(
                                 static_cast<unsigned char *>(received),
@@ -783,12 +780,18 @@ static int main_handler(int event_type, int param_one, int param_two) {
 
         current_picture_name[0] = '\0';
         show_next_picture();
-    } else if (EVT_SHOW == event_type || EVT_REPAINT == event_type ||
-               EVT_FOREGROUND == event_type || EVT_ACTIVATE == event_type) {
+    } else if (EVT_SHOW == event_type || EVT_REPAINT == event_type) {
         repaint_current_picture();
+    } else if (EVT_FOREGROUND == event_type || EVT_ACTIVATE == event_type) {
+        repaint_current_picture();
+        if (remote_mode && !diagnostics_visible) {
+            clear_remote_refresh();
+            schedule_remote_refresh(100);
+        }
     } else if (EVT_HIDE == event_type || EVT_BACKGROUND == event_type) {
         ClearTimer(show_next_picture);
         clear_remote_refresh();
+        release_network();
     } else if (EVT_EXIT == event_type) {
         ClearTimer(show_next_picture);
         clear_remote_refresh();
