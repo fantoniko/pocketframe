@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - app/**
+      - tools/sleep-probe/**
       - Dockerfile
       - build.sh
       - build.ps1
@@ -12,6 +13,7 @@ on:
   pull_request:
     paths:
       - app/**
+      - tools/sleep-probe/**
       - Dockerfile
       - build.sh
       - build.ps1
@@ -34,9 +36,11 @@ jobs:
           trap 'docker rm "$container_id" >/dev/null' EXIT
           mkdir -p build
           docker cp "$container_id:/home/app/pocketframe.app" build/pocketframe.app
+          docker cp "$container_id:/home/app/sleep-probe.app" build/sleep-probe.app
           test -s build/pocketframe.app
+          test -s build/sleep-probe.app
       - uses: actions/upload-artifact@v4
         with:
           name: pocketframe-app
-          path: build/pocketframe.app
+          path: build/*.app
           if-no-files-found: error

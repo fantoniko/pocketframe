@@ -20,7 +20,11 @@ ENV FRSCSDK="${HOME}/development/pocketbook-sdk-fw4/FRSCSDK"
 
 # Build our app
 FROM builder AS build_app
-COPY app/main.cpp ./
+COPY app/main.cpp ./main.cpp
+COPY tools/sleep-probe/main.cpp ./sleep-probe.cpp
 RUN ${FRSCSDK}/bin/arm-none-linux-gnueabi-g++ \
  -Wall -Wextra -Wmissing-field-initializers -Wshadow -Wno-unused-parameter -Wno-unused-function \
  -O2 main.cpp -o pocketframe.app -linkview -s
+RUN ${FRSCSDK}/bin/arm-none-linux-gnueabi-g++ \
+ -Wall -Wextra -Wmissing-field-initializers -Wshadow -Wno-unused-parameter -Wno-unused-function \
+ -O2 sleep-probe.cpp -o sleep-probe.app -linkview -s

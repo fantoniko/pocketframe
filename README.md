@@ -210,3 +210,29 @@ refresh while the app is open.
 Automatic updates all night require the device to stay awake and will consume
 substantially more battery. PocketFrame disconnects Wi-Fi immediately after
 every request.
+
+### Experimental scheduled wakeup probe
+
+`build/sleep-probe.app` tests whether the current PocketBook firmware can wake
+an InkView application from suspend using the RTC-backed `GoSleep` call. It is a
+separate application and does not change PocketFrame behavior, use Wi-Fi, write
+state files, or repeat the test automatically.
+
+Before testing, temporarily set both `Lock Device after` and `Auto Power Off`
+to `Off`. Copy `sleep-probe.app` to the device `applications` directory, launch
+it, and press OK once. The probe paints its status, waits two seconds for the
+E-Ink update, and requests a 120-second sleep with `GoSleep(120000, 0)`.
+
+Do not press a button for at least two minutes. A successful test returns to a
+result screen automatically and reports:
+
+* start and finish time;
+* actual elapsed seconds;
+* the `GoSleep` result code;
+* battery percentage before and after.
+
+If the result screen has not appeared after three minutes, press the power or
+OK button once. The probe will classify an early return as interrupted or
+unsupported. Wait three seconds before pressing OK to start another cycle;
+this debounce prevents the wakeup key from immediately starting a new sleep.
+Back or Home exits the probe.

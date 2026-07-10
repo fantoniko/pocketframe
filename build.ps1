@@ -33,6 +33,7 @@ try {
 
     Write-Host "# Copying built artifacts from the container..."
     Invoke-Docker @("cp", "${containerId}:/home/app/pocketframe.app", "build/pocketframe.app")
+    Invoke-Docker @("cp", "${containerId}:/home/app/sleep-probe.app", "build/sleep-probe.app")
 } finally {
     if ($containerId) {
         Invoke-Docker @("rm", $containerId) | Out-Null
