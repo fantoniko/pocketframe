@@ -28,7 +28,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: docker build --tag pocketbook-client --file Dockerfile .
       - name: Extract application
         run: |
@@ -39,7 +39,7 @@ jobs:
           docker cp "$container_id:/home/app/sleep-probe.app" build/sleep-probe.app
           test -s build/pocketframe.app
           test -s build/sleep-probe.app
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pocketframe-app
           path: build/*.app
