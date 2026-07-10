@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -33,14 +34,29 @@ func encodeTestJPEG(t *testing.T, width, height int) []byte {
 
 func testConfig(framePath string) config {
 	return config{
-		readToken:      testToken,
-		uploadToken:    "fedcba9876543210",
-		framePath:      framePath,
-		mode:           "cover",
-		quality:        85,
-		maxUploadBytes: 15 * 1024 * 1024,
-		maxImagePixels: 25 * 1000 * 1000,
+		readToken:               testToken,
+		uploadToken:             "fedcba9876543210",
+		framePath:               framePath,
+		mode:                    "cover",
+		quality:                 85,
+		maxUploadBytes:          15 * 1024 * 1024,
+		maxImagePixels:          25 * 1000 * 1000,
+		nextPollSeconds:         3600,
+		retryAfterSeconds:       1800,
+		schedulePeriodSeconds:   3600,
+		readDelaySeconds:        300,
+		missingSlotRetrySeconds: 300,
+		metadataPath:            framePath + ".json",
 	}
+}
+
+func setPublicationHeaders(request *http.Request, slot int64, readDelay int) {
+	id := "pocketframe-" + strconv.FormatInt(slot, 10)
+	request.Header.Set("X-PocketFrame-Publication-Id", id)
+	request.Header.Set("X-PocketFrame-Publication-Slot", strconv.FormatInt(slot, 10))
+	request.Header.Set("X-PocketFrame-Scheduled-At", time.Unix(slot, 0).UTC().Format(time.RFC3339))
+	request.Header.Set("X-PocketFrame-Read-Delay-Seconds", strconv.Itoa(readDelay))
+	request.Header.Set("Idempotency-Key", id)
 }
 
 func TestPrepareProducesPocketBookGrayscale(t *testing.T) {
@@ -139,8 +155,8 @@ func TestIsSupportedImage(t *testing.T) {
 func TestStatusRequiresTokenAndReturnsFrameMetadata(t *testing.T) {
 	updated := time.Date(2026, time.July, 10, 12, 0, 0, 0, time.UTC)
 	server := &server{
-		config:                config{readToken: testToken, nextPollSeconds: 3600},
-		meta:                  metadata{revision: "abc123", updatedAt: updated, frameBytes: 4567},
+		config:                testConfig(filepath.Join(t.TempDir(), "frame.jpg")),
+		meta:                  metadata{revision: "abc123", publicationID: "pocketframe-1783684800", publicationSlot: 1783684800, scheduledAt: updated, publishedAt: updated, readyAt: updated, idempotencyKey: "pocketframe-1783684800", frameBytes: 4567},
 		manifestRequests:      7,
 		lastManifestRequestAt: updated,
 		frameRequests:         3,
@@ -176,7 +192,8 @@ func TestManifestAndFrameUpdateRequestMetrics(t *testing.T) {
 	directory := t.TempDir()
 	server := &server{
 		config: testConfig(filepath.Join(directory, "frame.jpg")),
-		meta:   metadata{revision: "abc123", updatedAt: time.Now(), frameBytes: 4},
+		meta:   metadata{revision: "abc123", publicationID: "current", publicationSlot: 1783684800, scheduledAt: time.Unix(1783684800, 0), publishedAt: time.Unix(1783684800, 0), readyAt: time.Unix(1783684800, 0), idempotencyKey: "current", frameBytes: 4},
+		now:    func() time.Time { return time.Unix(1783685100, 0).UTC() },
 	}
 	if err := os.WriteFile(server.config.framePath, []byte("jpeg"), 0600); err != nil {
 		t.Fatal(err)
@@ -284,5 +301,158 @@ func TestUploadRejectsKnownOversizedBodyBeforeReading(t *testing.T) {
 	server.upload(response, request)
 	if response.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("upload status = %d, want %d", response.Code, http.StatusRequestEntityTooLarge)
+	}
+}
+
+func TestUploadStoresPublicationMetadata(t *testing.T) {
+	now := time.Date(2026, time.July, 10, 12, 0, 0, 0, time.UTC)
+	framePath := filepath.Join(t.TempDir(), "frame.jpg")
+	appServer := &server{config: testConfig(framePath), now: func() time.Time { return now }}
+	request := httptest.NewRequest(http.MethodPost, "/api/frame", bytes.NewReader(encodeTestJPEG(t, 8, 8)))
+	request.Header.Set("Content-Type", "image/jpeg")
+	request.Header.Set("Authorization", "Bearer "+appServer.config.uploadToken)
+	setPublicationHeaders(request, now.Unix(), 300)
+	response := httptest.NewRecorder()
+
+	appServer.upload(response, request)
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("upload status = %d, want %d: %s", response.Code, http.StatusCreated, response.Body.String())
+	}
+	for _, expected := range []string{
+		"publication_id=pocketframe-" + strconv.FormatInt(now.Unix(), 10),
+		"publication_slot=" + strconv.FormatInt(now.Unix(), 10),
+		"published_at=" + strconv.FormatInt(now.Unix(), 10),
+		"ready_at=" + strconv.FormatInt(now.Add(5*time.Minute).Unix(), 10),
+		"update_ready=0",
+	} {
+		if !strings.Contains(response.Body.String(), expected) {
+			t.Fatalf("manifest %q does not contain %q", response.Body.String(), expected)
+		}
+	}
+	reloaded := &server{config: testConfig(framePath), now: func() time.Time { return now }}
+	if err := reloaded.loadExistingFrame(); err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.meta.publicationID != "pocketframe-"+strconv.FormatInt(now.Unix(), 10) ||
+		reloaded.meta.readyAt != now.Add(5*time.Minute) {
+		t.Fatalf("reloaded metadata = %#v", reloaded.meta)
+	}
+}
+
+func TestUploadIsIdempotentForPublicationSlot(t *testing.T) {
+	now := time.Date(2026, time.July, 10, 12, 0, 0, 0, time.UTC)
+	server := &server{config: testConfig(filepath.Join(t.TempDir(), "frame.jpg")), now: func() time.Time { return now }}
+	first := httptest.NewRequest(http.MethodPost, "/api/frame", bytes.NewReader(encodeTestJPEG(t, 8, 8)))
+	first.Header.Set("Content-Type", "image/jpeg")
+	first.Header.Set("Authorization", "Bearer "+server.config.uploadToken)
+	setPublicationHeaders(first, now.Unix(), 300)
+	firstResponse := httptest.NewRecorder()
+	server.upload(firstResponse, first)
+	if firstResponse.Code != http.StatusCreated {
+		t.Fatalf("first upload = %d: %s", firstResponse.Code, firstResponse.Body.String())
+	}
+	firstMeta := server.meta
+
+	retry := httptest.NewRequest(http.MethodPost, "/api/frame", strings.NewReader("not an image"))
+	retry.Header.Set("Content-Type", "image/jpeg")
+	retry.Header.Set("Authorization", "Bearer "+server.config.uploadToken)
+	setPublicationHeaders(retry, now.Unix(), 300)
+	retryResponse := httptest.NewRecorder()
+	server.upload(retryResponse, retry)
+
+	if retryResponse.Code != http.StatusOK {
+		t.Fatalf("idempotent retry = %d, want %d: %s", retryResponse.Code, http.StatusOK, retryResponse.Body.String())
+	}
+	if server.meta != firstMeta {
+		t.Fatalf("metadata changed on retry: %#v != %#v", server.meta, firstMeta)
+	}
+}
+
+func TestSameJPEGWithNewPublicationIDIsNewPublication(t *testing.T) {
+	now := time.Date(2026, time.July, 10, 12, 0, 0, 0, time.UTC)
+	server := &server{config: testConfig(filepath.Join(t.TempDir(), "frame.jpg")), now: func() time.Time { return now }}
+	encoded := encodeTestJPEG(t, 8, 8)
+	upload := func(slot time.Time) metadata {
+		now = slot
+		request := httptest.NewRequest(http.MethodPost, "/api/frame", bytes.NewReader(encoded))
+		request.Header.Set("Content-Type", "image/jpeg")
+		request.Header.Set("Authorization", "Bearer "+server.config.uploadToken)
+		setPublicationHeaders(request, slot.Unix(), 300)
+		response := httptest.NewRecorder()
+		server.upload(response, request)
+		if response.Code != http.StatusCreated {
+			t.Fatalf("upload at %s = %d: %s", slot, response.Code, response.Body.String())
+		}
+		return server.meta
+	}
+	first := upload(now)
+	second := upload(now.Add(time.Hour))
+	if first.revision != second.revision {
+		t.Fatalf("identical JPEG revision changed: %s != %s", first.revision, second.revision)
+	}
+	if first.publicationID == second.publicationID || second.publicationSlot-first.publicationSlot != 3600 {
+		t.Fatalf("publication was not advanced: %#v -> %#v", first, second)
+	}
+}
+
+func TestManifestBeforeAndAfterReadyAt(t *testing.T) {
+	slot := time.Date(2026, time.July, 10, 12, 0, 0, 0, time.UTC)
+	now := slot.Add(4 * time.Minute)
+	server := &server{
+		config: testConfig(filepath.Join(t.TempDir(), "frame.jpg")),
+		now:    func() time.Time { return now },
+		meta: metadata{
+			revision: "abc", publicationID: "pocketframe-" + strconv.FormatInt(slot.Unix(), 10),
+			publicationSlot: slot.Unix(), scheduledAt: slot, publishedAt: slot,
+			readyAt: slot.Add(5 * time.Minute), idempotencyKey: "pocketframe-" + strconv.FormatInt(slot.Unix(), 10),
+		},
+	}
+	before := httptest.NewRecorder()
+	server.manifest(before, httptest.NewRequest(http.MethodGet, "/manifest?token="+testToken, nil))
+	if !strings.Contains(before.Body.String(), "update_ready=0") || !strings.Contains(before.Body.String(), "next_poll_seconds=300") {
+		t.Fatalf("manifest before ready_at = %q", before.Body.String())
+	}
+
+	now = slot.Add(5 * time.Minute)
+	after := httptest.NewRecorder()
+	server.manifest(after, httptest.NewRequest(http.MethodGet, "/manifest?token="+testToken, nil))
+	if !strings.Contains(after.Body.String(), "update_ready=1") || !strings.Contains(after.Body.String(), "next_poll_seconds=3600") {
+		t.Fatalf("manifest after ready_at = %q", after.Body.String())
+	}
+}
+
+func TestManifestMissingCurrentSlotUsesShortRetry(t *testing.T) {
+	oldSlot := time.Date(2026, time.July, 10, 12, 0, 0, 0, time.UTC)
+	now := oldSlot.Add(time.Hour + 5*time.Minute)
+	server := &server{
+		config: testConfig(filepath.Join(t.TempDir(), "frame.jpg")),
+		now:    func() time.Time { return now },
+		meta: metadata{
+			revision: "old", publicationID: "pocketframe-" + strconv.FormatInt(oldSlot.Unix(), 10),
+			publicationSlot: oldSlot.Unix(), scheduledAt: oldSlot, publishedAt: oldSlot,
+			readyAt: oldSlot.Add(5 * time.Minute), idempotencyKey: "pocketframe-" + strconv.FormatInt(oldSlot.Unix(), 10),
+		},
+	}
+	response := httptest.NewRecorder()
+	server.manifest(response, httptest.NewRequest(http.MethodGet, "/manifest?token="+testToken, nil))
+	if !strings.Contains(response.Body.String(), "update_ready=0") ||
+		!strings.Contains(response.Body.String(), "retry_after_seconds=300") {
+		t.Fatalf("missing-slot manifest = %q", response.Body.String())
+	}
+}
+
+func TestNextPollUsesAbsoluteHourlySlot(t *testing.T) {
+	slot := time.Date(2026, time.July, 10, 12, 0, 0, 0, time.UTC)
+	server := &server{config: testConfig(filepath.Join(t.TempDir(), "frame.jpg"))}
+	meta := metadata{publicationSlot: slot.Unix(), readyAt: slot.Add(5 * time.Minute)}
+
+	ready, nextPoll, _ := server.manifestTiming(meta, slot.Add(23*time.Minute))
+	if !ready || nextPoll != 42*60 {
+		t.Fatalf("12:23 timing = ready %v, next %d; want true, 2520", ready, nextPoll)
+	}
+	ready, nextPoll, _ = server.manifestTiming(meta, slot.Add(59*time.Minute+50*time.Second))
+	if !ready || nextPoll != 5*60+10 {
+		t.Fatalf("12:59:50 timing = ready %v, next %d; want true, 310", ready, nextPoll)
 	}
 }

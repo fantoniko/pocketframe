@@ -35,28 +35,64 @@ const (
 )
 
 type config struct {
-	readToken         string
-	uploadToken       string
-	legacyUploadQuery bool
-	framePath         string
-	mode              string
-	quality           int
-	maxUploadBytes    int64
-	maxImagePixels    int64
-	nextPollSeconds   int
-	retryAfterSeconds int
+	readToken               string
+	uploadToken             string
+	legacyUploadQuery       bool
+	framePath               string
+	mode                    string
+	quality                 int
+	maxUploadBytes          int64
+	maxImagePixels          int64
+	nextPollSeconds         int
+	retryAfterSeconds       int
+	schedulePeriodSeconds   int
+	scheduleOffsetSeconds   int
+	readDelaySeconds        int
+	missingSlotRetrySeconds int
+	metadataPath            string
 }
 
 type metadata struct {
-	revision   string
-	updatedAt  time.Time
-	frameBytes int64
+	revision        string
+	publicationID   string
+	publicationSlot int64
+	scheduledAt     time.Time
+	publishedAt     time.Time
+	readyAt         time.Time
+	idempotencyKey  string
+	frameBytes      int64
+}
+
+type persistedMetadata struct {
+	Revision        string `json:"revision"`
+	PublicationID   string `json:"publication_id"`
+	PublicationSlot int64  `json:"publication_slot"`
+	ScheduledAt     int64  `json:"scheduled_at"`
+	PublishedAt     int64  `json:"published_at"`
+	ReadyAt         int64  `json:"ready_at"`
+	IdempotencyKey  string `json:"idempotency_key"`
+	FrameBytes      int64  `json:"frame_bytes"`
+}
+
+type publication struct {
+	id             string
+	slot           int64
+	scheduledAt    time.Time
+	readDelay      time.Duration
+	idempotencyKey string
+	receivedAt     time.Time
+	legacy         bool
 }
 
 type statusResponse struct {
 	Ready                 bool   `json:"ready"`
 	Revision              string `json:"revision,omitempty"`
 	UpdatedAt             string `json:"updated_at,omitempty"`
+	PublicationID         string `json:"publication_id,omitempty"`
+	PublicationSlot       int64  `json:"publication_slot,omitempty"`
+	ScheduledAt           string `json:"scheduled_at,omitempty"`
+	ReadyAt               string `json:"ready_at,omitempty"`
+	UpdateReady           bool   `json:"update_ready"`
 	FrameBytes            int64  `json:"frame_bytes,omitempty"`
 	TargetWidth           int    `json:"target_width"`
 	TargetHeight          int    `json:"target_height"`
@@ -77,6 +113,7 @@ type server struct {
 	lastManifestRequestAt time.Time
 	frameRequests         uint64
 	lastFrameRequestAt    time.Time
+	now                   func() time.Time
 }
 
 func main() {
@@ -179,18 +216,40 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	schedulePeriodSeconds, err := getenvInt("POCKETFRAME_SCHEDULE_PERIOD_SECONDS", nextPollSeconds, 300, 86400)
+	if err != nil {
+		return config{}, err
+	}
+	scheduleOffsetSeconds, err := getenvInt("POCKETFRAME_SCHEDULE_OFFSET_SECONDS", 0, 0, schedulePeriodSeconds-1)
+	if err != nil {
+		return config{}, err
+	}
+	readDelaySeconds, err := getenvInt("POCKETFRAME_READ_DELAY_SECONDS", 300, 0, 86400)
+	if err != nil {
+		return config{}, err
+	}
+	missingSlotRetrySeconds, err := getenvInt("POCKETFRAME_MISSING_SLOT_RETRY_SECONDS", 300, 300, 86400)
+	if err != nil {
+		return config{}, err
+	}
+	framePath := getenv("POCKETFRAME_FRAME_PATH", "/data/frame.jpg")
 
 	return config{
-		readToken:         readToken,
-		uploadToken:       uploadToken,
-		legacyUploadQuery: legacyUploadQuery,
-		framePath:         getenv("POCKETFRAME_FRAME_PATH", "/data/frame.jpg"),
-		mode:              mode,
-		quality:           quality,
-		maxUploadBytes:    int64(maxMegabytes) * 1024 * 1024,
-		maxImagePixels:    int64(maxImageMegapixels) * 1000 * 1000,
-		nextPollSeconds:   nextPollSeconds,
-		retryAfterSeconds: retryAfterSeconds,
+		readToken:               readToken,
+		uploadToken:             uploadToken,
+		legacyUploadQuery:       legacyUploadQuery,
+		framePath:               framePath,
+		mode:                    mode,
+		quality:                 quality,
+		maxUploadBytes:          int64(maxMegabytes) * 1024 * 1024,
+		maxImagePixels:          int64(maxImageMegapixels) * 1000 * 1000,
+		nextPollSeconds:         nextPollSeconds,
+		retryAfterSeconds:       retryAfterSeconds,
+		schedulePeriodSeconds:   schedulePeriodSeconds,
+		scheduleOffsetSeconds:   scheduleOffsetSeconds,
+		readDelaySeconds:        readDelaySeconds,
+		missingSlotRetrySeconds: missingSlotRetrySeconds,
+		metadataPath:            getenv("POCKETFRAME_METADATA_PATH", framePath+".json"),
 	}, nil
 }
 
@@ -237,6 +296,55 @@ func (s *server) health(writer http.ResponseWriter, request *http.Request) {
 	writer.WriteHeader(http.StatusNoContent)
 }
 
+func (s *server) currentTime() time.Time {
+	if s.now != nil {
+		return s.now().UTC()
+	}
+	return time.Now().UTC()
+}
+
+func (s *server) schedulePeriod() int64 {
+	if s.config.schedulePeriodSeconds > 0 {
+		return int64(s.config.schedulePeriodSeconds)
+	}
+	if s.config.nextPollSeconds > 0 {
+		return int64(s.config.nextPollSeconds)
+	}
+	return 3600
+}
+
+func (s *server) expectedSlot(at time.Time) int64 {
+	period := s.schedulePeriod()
+	offset := int64(s.config.scheduleOffsetSeconds)
+	return ((at.Unix() - offset) / period * period) + offset
+}
+
+func (s *server) manifestTiming(meta metadata, now time.Time) (bool, int, int) {
+	expectedSlot := s.expectedSlot(now)
+	ready := meta.publicationSlot == expectedSlot && !now.Before(meta.readyAt)
+	if !ready {
+		retry := s.config.missingSlotRetrySeconds
+		if retry <= 0 {
+			retry = 300
+		}
+		return false, retry, retry
+	}
+
+	nextReadyAt := time.Unix(expectedSlot+s.schedulePeriod()+int64(s.config.readDelaySeconds), 0)
+	seconds := int(nextReadyAt.Sub(now).Seconds())
+	if nextReadyAt.After(now.Add(time.Duration(seconds) * time.Second)) {
+		seconds++
+	}
+	if seconds < 1 {
+		seconds = 1
+	}
+	retry := s.config.retryAfterSeconds
+	if retry <= 0 {
+		retry = 300
+	}
+	return true, seconds, retry
+}
+
 func (s *server) manifest(writer http.ResponseWriter, request *http.Request) {
 	if !s.authorizedRead(writer, request) {
 		return
@@ -244,7 +352,8 @@ func (s *server) manifest(writer http.ResponseWriter, request *http.Request) {
 
 	s.mu.Lock()
 	s.manifestRequests++
-	s.lastManifestRequestAt = time.Now().UTC()
+	now := s.currentTime()
+	s.lastManifestRequestAt = now
 	meta := s.meta
 	s.mu.Unlock()
 	if meta.revision == "" {
@@ -252,7 +361,7 @@ func (s *server) manifest(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	s.writeManifest(writer, http.StatusOK, meta)
+	s.writeManifest(writer, http.StatusOK, meta, now)
 }
 
 func (s *server) frame(writer http.ResponseWriter, request *http.Request) {
@@ -262,10 +371,11 @@ func (s *server) frame(writer http.ResponseWriter, request *http.Request) {
 
 	s.mu.Lock()
 	s.frameRequests++
-	s.lastFrameRequestAt = time.Now().UTC()
-	ready := s.meta.revision != ""
+	now := s.currentTime()
+	s.lastFrameRequestAt = now
+	meta := s.meta
 	s.mu.Unlock()
-	if !ready {
+	if meta.revision == "" || now.Before(meta.readyAt) {
 		http.Error(writer, "frame is not ready", http.StatusServiceUnavailable)
 		return
 	}
@@ -295,6 +405,7 @@ func (s *server) status(writer http.ResponseWriter, request *http.Request) {
 		ManifestRequests: manifestRequests,
 		FrameRequests:    frameRequests,
 	}
+	response.UpdateReady, _, _ = s.manifestTiming(meta, s.currentTime())
 	if !lastManifestRequestAt.IsZero() {
 		response.LastManifestRequestAt = lastManifestRequestAt.Format(time.RFC3339)
 	}
@@ -303,7 +414,11 @@ func (s *server) status(writer http.ResponseWriter, request *http.Request) {
 	}
 	if response.Ready {
 		response.Revision = meta.revision
-		response.UpdatedAt = meta.updatedAt.UTC().Format(time.RFC3339)
+		response.UpdatedAt = meta.publishedAt.UTC().Format(time.RFC3339)
+		response.PublicationID = meta.publicationID
+		response.PublicationSlot = meta.publicationSlot
+		response.ScheduledAt = meta.scheduledAt.UTC().Format(time.RFC3339)
+		response.ReadyAt = meta.readyAt.UTC().Format(time.RFC3339)
 		response.FrameBytes = meta.frameBytes
 	}
 
@@ -327,9 +442,32 @@ func (s *server) upload(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, "image is too large", http.StatusRequestEntityTooLarge)
 		return
 	}
+	publication, err := s.parsePublication(request)
+	if err != nil {
+		http.Error(writer, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	s.uploadMu.Lock()
 	defer s.uploadMu.Unlock()
+	s.mu.RLock()
+	currentMeta := s.meta
+	s.mu.RUnlock()
+	if currentMeta.idempotencyKey != "" && currentMeta.idempotencyKey == publication.idempotencyKey {
+		if currentMeta.publicationID != publication.id || currentMeta.publicationSlot != publication.slot {
+			http.Error(writer, "idempotency key conflicts with the current publication", http.StatusConflict)
+			return
+		}
+		s.writeManifest(writer, http.StatusOK, currentMeta, s.currentTime())
+		return
+	}
+	currentIsLegacy := strings.HasPrefix(currentMeta.publicationID, "legacy-")
+	if currentMeta.publicationSlot > publication.slot ||
+		(currentMeta.publicationSlot == publication.slot && currentMeta.publicationID != publication.id &&
+			!currentIsLegacy && !publication.legacy) {
+		http.Error(writer, "publication slot is stale or already has another publication", http.StatusConflict)
+		return
+	}
 	request.Body = http.MaxBytesReader(writer, request.Body, s.config.maxUploadBytes)
 	encoded, err := io.ReadAll(request.Body)
 	if err != nil {
@@ -341,13 +479,77 @@ func (s *server) upload(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	meta, err := s.publish(encoded)
+	meta, err := s.publishForPublication(encoded, publication)
 	if err != nil {
 		log.Printf("reject upload: %v", err)
 		http.Error(writer, "could not process image", http.StatusBadRequest)
 		return
 	}
-	s.writeManifest(writer, http.StatusCreated, meta)
+	s.writeManifest(writer, http.StatusCreated, meta, s.currentTime())
+}
+
+func (s *server) parsePublication(request *http.Request) (publication, error) {
+	now := s.currentTime()
+	headerNames := []string{
+		"X-PocketFrame-Publication-Id",
+		"X-PocketFrame-Publication-Slot",
+		"X-PocketFrame-Scheduled-At",
+		"X-PocketFrame-Read-Delay-Seconds",
+		"Idempotency-Key",
+	}
+	provided := 0
+	for _, name := range headerNames {
+		if request.Header.Get(name) != "" {
+			provided++
+		}
+	}
+	if provided == 0 {
+		slot := s.expectedSlot(now)
+		id := fmt.Sprintf("legacy-%d", now.UnixNano())
+		return publication{
+			id: id, slot: slot, scheduledAt: time.Unix(slot, 0).UTC(),
+			idempotencyKey: id, receivedAt: now, legacy: true,
+		}, nil
+	}
+	if provided != len(headerNames) {
+		return publication{}, errors.New("all PocketFrame publication headers are required")
+	}
+
+	slot, err := strconv.ParseInt(request.Header.Get("X-PocketFrame-Publication-Slot"), 10, 64)
+	if err != nil || slot <= 0 {
+		return publication{}, errors.New("X-PocketFrame-Publication-Slot must be a positive Unix timestamp")
+	}
+	period := s.schedulePeriod()
+	offset := int64(s.config.scheduleOffsetSeconds)
+	if (slot-offset)%period != 0 {
+		return publication{}, errors.New("publication slot is not aligned to the configured UTC schedule")
+	}
+	expectedID := fmt.Sprintf("pocketframe-%d", slot)
+	publicationID := request.Header.Get("X-PocketFrame-Publication-Id")
+	idempotencyKey := request.Header.Get("Idempotency-Key")
+	if publicationID != expectedID || idempotencyKey != expectedID {
+		return publication{}, errors.New("publication id and idempotency key must match pocketframe-<slot>")
+	}
+	scheduledAt, err := time.Parse(time.RFC3339, request.Header.Get("X-PocketFrame-Scheduled-At"))
+	if err != nil || !scheduledAt.Equal(time.Unix(slot, 0)) {
+		return publication{}, errors.New("X-PocketFrame-Scheduled-At must equal the publication slot in RFC3339 UTC")
+	}
+	readDelaySeconds, err := strconv.Atoi(request.Header.Get("X-PocketFrame-Read-Delay-Seconds"))
+	if err != nil || readDelaySeconds < 0 || readDelaySeconds > 86400 {
+		return publication{}, errors.New("X-PocketFrame-Read-Delay-Seconds must be from 0 to 86400")
+	}
+	if readDelaySeconds != s.config.readDelaySeconds {
+		return publication{}, errors.New("publication read delay does not match POCKETFRAME_READ_DELAY_SECONDS")
+	}
+	currentSlot := s.expectedSlot(now)
+	if slot != currentSlot {
+		return publication{}, errors.New("publication slot is outside the current scheduling window")
+	}
+	return publication{
+		id: publicationID, slot: slot, scheduledAt: scheduledAt.UTC(),
+		readDelay:      time.Duration(readDelaySeconds) * time.Second,
+		idempotencyKey: idempotencyKey, receivedAt: now,
+	}, nil
 }
 
 func secureTokenEqual(actual, expected string) bool {
@@ -376,12 +578,21 @@ func (s *server) authorizedUpload(writer http.ResponseWriter, request *http.Requ
 	return false
 }
 
-func (s *server) writeManifest(writer http.ResponseWriter, status int, meta metadata) {
+func (s *server) writeManifest(writer http.ResponseWriter, status int, meta metadata, now time.Time) {
+	ready, nextPollSeconds, retryAfterSeconds := s.manifestTiming(meta, now)
 	writer.Header().Set("Cache-Control", "no-store")
 	writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	writer.WriteHeader(status)
-	fmt.Fprintf(writer, "revision=%s\nnext_poll_seconds=%d\nretry_after_seconds=%d\n",
-		meta.revision, s.config.nextPollSeconds, s.config.retryAfterSeconds)
+	fmt.Fprintf(writer, "revision=%s\npublication_id=%s\npublication_slot=%d\npublished_at=%d\nready_at=%d\nupdate_ready=%d\nnext_poll_seconds=%d\nretry_after_seconds=%d\n",
+		meta.revision, meta.publicationID, meta.publicationSlot, meta.publishedAt.Unix(),
+		meta.readyAt.Unix(), boolInt(ready), nextPollSeconds, retryAfterSeconds)
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func (s *server) loadExistingFrame() error {
@@ -393,10 +604,85 @@ func (s *server) loadExistingFrame() error {
 	if err != nil {
 		return err
 	}
+	frameRevision := revision(data)
+	meta, err := s.loadPersistedMetadata()
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("load frame metadata: %w", err)
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		publishedAt := info.ModTime().UTC()
+		slot := s.expectedSlot(publishedAt)
+		id := fmt.Sprintf("legacy-%d", publishedAt.UnixNano())
+		meta = metadata{
+			revision: frameRevision, publicationID: id, publicationSlot: slot,
+			scheduledAt: time.Unix(slot, 0).UTC(), publishedAt: publishedAt,
+			readyAt: publishedAt, idempotencyKey: id, frameBytes: info.Size(),
+		}
+	} else if meta.revision != frameRevision {
+		return errors.New("frame metadata revision does not match frame.jpg")
+	}
+	meta.frameBytes = info.Size()
 	s.mu.Lock()
-	s.meta = metadata{revision: revision(data), updatedAt: info.ModTime(), frameBytes: info.Size()}
+	s.meta = meta
 	s.mu.Unlock()
 	return nil
+}
+
+func (s *server) loadPersistedMetadata() (metadata, error) {
+	data, err := os.ReadFile(s.config.metadataPath)
+	if err != nil {
+		return metadata{}, err
+	}
+	var persisted persistedMetadata
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		return metadata{}, err
+	}
+	if persisted.Revision == "" || persisted.PublicationID == "" || persisted.PublicationSlot <= 0 ||
+		persisted.PublishedAt <= 0 || persisted.ReadyAt <= 0 || persisted.IdempotencyKey == "" {
+		return metadata{}, errors.New("stored frame metadata is incomplete")
+	}
+	return metadata{
+		revision: persisted.Revision, publicationID: persisted.PublicationID,
+		publicationSlot: persisted.PublicationSlot,
+		scheduledAt:     time.Unix(persisted.ScheduledAt, 0).UTC(),
+		publishedAt:     time.Unix(persisted.PublishedAt, 0).UTC(),
+		readyAt:         time.Unix(persisted.ReadyAt, 0).UTC(),
+		idempotencyKey:  persisted.IdempotencyKey, frameBytes: persisted.FrameBytes,
+	}, nil
+}
+
+func (s *server) saveMetadata(meta metadata) error {
+	persisted := persistedMetadata{
+		Revision: meta.revision, PublicationID: meta.publicationID,
+		PublicationSlot: meta.publicationSlot, ScheduledAt: meta.scheduledAt.Unix(),
+		PublishedAt: meta.publishedAt.Unix(), ReadyAt: meta.readyAt.Unix(),
+		IdempotencyKey: meta.idempotencyKey, FrameBytes: meta.frameBytes,
+	}
+	data, err := json.Marshal(persisted)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(s.config.metadataPath), 0755); err != nil {
+		return err
+	}
+	temporary, err := os.CreateTemp(filepath.Dir(s.config.metadataPath), ".frame-meta-*.json")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0600); err != nil {
+		temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(data); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, s.config.metadataPath)
 }
 
 func revision(data []byte) string {
@@ -405,6 +691,16 @@ func revision(data []byte) string {
 }
 
 func (s *server) publish(encoded []byte) (metadata, error) {
+	now := s.currentTime()
+	slot := s.expectedSlot(now)
+	id := fmt.Sprintf("legacy-%d", now.UnixNano())
+	return s.publishForPublication(encoded, publication{
+		id: id, slot: slot, scheduledAt: time.Unix(slot, 0).UTC(),
+		idempotencyKey: id, receivedAt: now,
+	})
+}
+
+func (s *server) publishForPublication(encoded []byte, publication publication) (metadata, error) {
 	s.publishMu.Lock()
 	defer s.publishMu.Unlock()
 
@@ -447,13 +743,14 @@ func (s *server) publish(encoded []byte) (metadata, error) {
 	s.mu.RLock()
 	currentMeta := s.meta
 	s.mu.RUnlock()
-	if currentMeta.revision == newRevision {
-		if _, err := os.Stat(s.config.framePath); err == nil {
-			return currentMeta, nil
-		}
+	frameExists := false
+	if _, err := os.Stat(s.config.framePath); err == nil {
+		frameExists = true
 	}
-	if err := os.Rename(temporaryPath, s.config.framePath); err != nil {
-		return metadata{}, fmt.Errorf("publish JPEG: %w", err)
+	if currentMeta.revision != newRevision || !frameExists {
+		if err := os.Rename(temporaryPath, s.config.framePath); err != nil {
+			return metadata{}, fmt.Errorf("publish JPEG: %w", err)
+		}
 	}
 
 	info, err := os.Stat(s.config.framePath)
@@ -461,9 +758,13 @@ func (s *server) publish(encoded []byte) (metadata, error) {
 		return metadata{}, fmt.Errorf("stat published JPEG: %w", err)
 	}
 	meta := metadata{
-		revision:   newRevision,
-		updatedAt:  info.ModTime(),
-		frameBytes: info.Size(),
+		revision: newRevision, publicationID: publication.id,
+		publicationSlot: publication.slot, scheduledAt: publication.scheduledAt,
+		publishedAt: publication.receivedAt, readyAt: publication.receivedAt.Add(publication.readDelay),
+		idempotencyKey: publication.idempotencyKey, frameBytes: info.Size(),
+	}
+	if err := s.saveMetadata(meta); err != nil {
+		return metadata{}, fmt.Errorf("persist frame metadata: %w", err)
 	}
 	s.mu.Lock()
 	s.meta = meta

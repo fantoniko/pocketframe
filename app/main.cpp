@@ -67,6 +67,10 @@ struct RemoteConfig {
 
 struct RemoteManifest {
     char revision[kMaxRevisionSize];
+    char publication_id[kMaxRevisionSize];
+    long publication_slot;
+    bool has_update_ready;
+    bool update_ready;
     int next_poll_seconds;
     int retry_after_seconds;
 };
@@ -80,6 +84,9 @@ static unsigned long long remote_hash = 0;
 static size_t remote_size = 0;
 static bool have_remote_revision = false;
 static char remote_revision[kMaxRevisionSize] = "";
+static bool have_remote_publication = false;
+static char remote_publication_id[kMaxRevisionSize] = "";
+static long remote_publication_slot = 0;
 static bool remote_refresh_scheduled = false;
 static int remote_next_poll_seconds = kDefaultRefreshSeconds;
 static int remote_retry_seconds = kDefaultRetrySeconds;
@@ -451,6 +458,7 @@ static bool save_remote_picture(const void *data, int size) {
 
 static bool parse_manifest(char *body, RemoteManifest *manifest) {
     memset(manifest, 0, sizeof(*manifest));
+    manifest->update_ready = true;
     char *line = body;
     while (line != NULL && *line != '\0') {
         char *next_line = strchr(line, '\n');
@@ -475,6 +483,21 @@ static bool parse_manifest(char *body, RemoteManifest *manifest) {
                 if (strcmp(key, "revision") == 0) {
                     snprintf(manifest->revision, sizeof(manifest->revision),
                              "%s", value);
+                } else if (strcmp(key, "publication_id") == 0) {
+                    snprintf(manifest->publication_id,
+                             sizeof(manifest->publication_id), "%s", value);
+                } else if (strcmp(key, "publication_slot") == 0) {
+                    char *end = NULL;
+                    long parsed = strtol(value, &end, 10);
+                    if (end != value && *end == '\0' && parsed > 0) {
+                        manifest->publication_slot = parsed;
+                    }
+                } else if (strcmp(key, "update_ready") == 0) {
+                    int parsed = 0;
+                    if (parse_limited_int(value, 0, 1, &parsed)) {
+                        manifest->has_update_ready = true;
+                        manifest->update_ready = parsed == 1;
+                    }
                 } else if (strcmp(key, "next_poll_seconds") == 0) {
                     parse_limited_int(value, kMinRefreshSeconds,
                                       kMaxPollSeconds,
@@ -523,6 +546,22 @@ static void load_remote_state() {
             have_remote_revision = remote_revision[0] != '\0';
             continue;
         }
+        prefix = "publication_id=";
+        if (strncmp(line, prefix, strlen(prefix)) == 0) {
+            snprintf(remote_publication_id, sizeof(remote_publication_id),
+                     "%s", line + strlen(prefix));
+            have_remote_publication = remote_publication_id[0] != '\0';
+            continue;
+        }
+        prefix = "publication_slot=";
+        if (strncmp(line, prefix, strlen(prefix)) == 0) {
+            char *end = NULL;
+            long value = strtol(line + strlen(prefix), &end, 10);
+            if (end != line + strlen(prefix) && *end == '\0' && value > 0) {
+                remote_publication_slot = value;
+            }
+            continue;
+        }
         prefix = "last_update=";
         if (strncmp(line, prefix, strlen(prefix)) == 0) {
             char *end = NULL;
@@ -536,7 +575,8 @@ static void load_remote_state() {
 }
 
 static bool save_remote_state() {
-    if (!have_remote_revision && last_image_update_time == 0) {
+    if (!have_remote_revision && !have_remote_publication &&
+        last_image_update_time == 0) {
         return true;
     }
     FILE *file = fopen(REMOTE_STATE_TEMP_PATH, "w");
@@ -546,6 +586,13 @@ static bool save_remote_state() {
     bool success = true;
     if (have_remote_revision) {
         success = fprintf(file, "revision=%s\n", remote_revision) > 0;
+    }
+    if (success && have_remote_publication) {
+        success = fprintf(file, "publication_id=%s\n", remote_publication_id) > 0;
+    }
+    if (success && remote_publication_slot > 0) {
+        success = fprintf(file, "publication_slot=%ld\n",
+                          remote_publication_slot) > 0;
     }
     if (success && last_image_update_time > 0) {
         success = fprintf(file, "last_update=%ld\n",
@@ -781,6 +828,21 @@ static void release_network() {
     NetDisconnect();
 }
 
+static bool apply_manifest_publication(const RemoteManifest *manifest) {
+    if (manifest->publication_id[0] == '\0') {
+        return false;
+    }
+    bool changed = !have_remote_publication ||
+                   strcmp(remote_publication_id,
+                          manifest->publication_id) != 0 ||
+                   remote_publication_slot != manifest->publication_slot;
+    snprintf(remote_publication_id, sizeof(remote_publication_id), "%s",
+             manifest->publication_id);
+    have_remote_publication = true;
+    remote_publication_slot = manifest->publication_slot;
+    return changed;
+}
+
 static bool refresh_remote_picture_now() {
     RemoteConfig loaded_config;
     if (!load_remote_config(&loaded_config)) {
@@ -816,8 +878,15 @@ static bool refresh_remote_picture_now() {
         if (manifest.retry_after_seconds > 0) {
             remote_retry_seconds = manifest.retry_after_seconds;
         }
+        if (manifest.has_update_ready && !manifest.update_ready) {
+            release_network();
+            return true;
+        }
         if (have_remote_revision &&
             strcmp(manifest.revision, remote_revision) == 0) {
+            if (apply_manifest_publication(&manifest)) {
+                save_remote_state();
+            }
             release_network();
             return true;
         }
@@ -846,6 +915,9 @@ static bool refresh_remote_picture_now() {
                 snprintf(remote_revision, sizeof(remote_revision), "%s",
                          manifest.revision);
                 have_remote_revision = true;
+                state_changed = true;
+            }
+            if (apply_manifest_publication(&manifest)) {
                 state_changed = true;
             }
         }
@@ -879,6 +951,7 @@ static bool refresh_remote_picture_now() {
         snprintf(remote_revision, sizeof(remote_revision), "%s",
                  manifest.revision);
         have_remote_revision = true;
+        apply_manifest_publication(&manifest);
     }
     last_image_update_time = time(NULL);
     save_remote_state();

@@ -37,12 +37,20 @@ uses `key=value` lines:
 
 ```ini
 revision=42
+publication_id=pocketframe-1783684800
+publication_slot=1783684800
+published_at=1783684803
+ready_at=1783685103
+update_ready=1
 next_poll_seconds=3600
 retry_after_seconds=1800
 ```
 
 `revision` is an opaque value, normally a content hash or monotonically
 increasing number. When it is unchanged, PocketFrame does not download the JPEG.
+When `update_ready=0`, PocketFrame keeps the cached image and sleeps until the
+server's retry. Publication ID and slot are persisted independently from the
+revision, so an unchanged image can still represent a new hourly publication.
 `next_poll_seconds` lets the server use longer intervals at night; on an error,
 `retry_after_seconds` controls the first retry attempt. Each consecutive error
 doubles that delay, capped by `retry_max_minutes` (four hours by default), and a
@@ -125,6 +133,30 @@ Upload a JPEG, PNG, or GIF as a raw HTTP body. `curl.exe` example:
 curl.exe -X POST --data-binary "@C:\Photos\new-frame.jpg" -H "Content-Type: image/jpeg" -H "Authorization: Bearer $uploadToken" "http://127.0.0.1:8080/api/frame"
 ```
 
+Uploads without scheduling headers remain compatible and become readable
+immediately. The synchronized publisher sends all of the following headers:
+
+```text
+X-PocketFrame-Publication-Id: pocketframe-<unix-slot>
+X-PocketFrame-Publication-Slot: <unix-slot>
+X-PocketFrame-Scheduled-At: <RFC3339 UTC matching the slot>
+X-PocketFrame-Read-Delay-Seconds: 300
+Idempotency-Key: pocketframe-<unix-slot>
+```
+
+The default UTC schedule uses one-hour slots at `HH:00` and exposes the new
+frame at `received_at + 300 seconds`. Its metadata is persisted beside the JPEG,
+so container restarts do not lose idempotency or slot state. Retries with the
+same key return the existing publication without reprocessing the image. An
+older slot cannot overwrite a newer one.
+
+`POCKETFRAME_SCHEDULE_PERIOD_SECONDS`, `POCKETFRAME_SCHEDULE_OFFSET_SECONDS`,
+and `POCKETFRAME_READ_DELAY_SECONDS` must match the publisher. While the current
+slot is missing or not yet ready, the manifest returns `update_ready=0` and
+`POCKETFRAME_MISSING_SLOT_RETRY_SECONDS` (default 300). Once ready, its
+`next_poll_seconds` points to the next absolute `slot + read delay`; it is not
+calculated from server or PocketBook process startup time.
+
 The response is the new manifest. The PocketBook only requests `/manifest` and
 `/frame.jpg`; it never uploads or processes the original image. A protected
 status endpoint is also available for monitoring the active prepared frame:
@@ -133,8 +165,8 @@ status endpoint is also available for monitoring the active prepared frame:
 curl.exe "http://127.0.0.1:8080/status?token=$readToken"
 ```
 
-It returns JSON with readiness, revision, publication time, prepared JPEG size,
-target dimensions, the server's requested polling interval, and RAM-only
+It returns JSON with readiness, revision, publication ID/slot, publish and ready
+times, prepared JPEG size, target dimensions, and RAM-only
 manifest/frame request counters with their latest timestamps. These counters
 reset when the container restarts and make scheduled wakeups observable without
 touching the PocketBook. Uploads are limited both by encoded size and source
@@ -230,11 +262,10 @@ and will consume substantially more battery. PocketFrame disconnects Wi-Fi
 immediately after every request.
 
 For automatic updates with the CPU suspended between checks, use the explicitly
-enabled `scheduled_sleep` mode described above. Start with a five-minute server
-poll interval for 30-60 minutes, then use 60 minutes for an overnight battery
-test before relying on it continuously. For the first test set
-`POCKETFRAME_NEXT_POLL_SECONDS=300` and
-`POCKETFRAME_RETRY_AFTER_SECONDS=300` in Portainer. Each RTC cycle increments
+enabled `scheduled_sleep` mode described above. For an accelerated test set
+`POCKETFRAME_SCHEDULE_PERIOD_SECONDS=600` and
+`POCKETFRAME_READ_DELAY_SECONDS=60` on both server and publisher. For production
+use `3600` and `300`. Each RTC cycle increments
 `manifest_requests` in `/status`; `frame_requests` increments only when a new
 revision requires downloading the JPEG.
 
