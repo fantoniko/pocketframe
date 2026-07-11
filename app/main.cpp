@@ -25,7 +25,9 @@ static const int kMinTimeoutSeconds = 5;
 static const int kMaxTimeoutSeconds = 60;
 static const int kDefaultWakeMinBatteryPercent = 20;
 static const int kSleepSettleMilliseconds = 2000;
+static const int kSleepRetrySettleMilliseconds = 5000;
 static const int kWakeSettleMilliseconds = 1000;
+static const int kMaxRtcSleepChunkSeconds = 45 * 60;
 static const int kImmediateSleepFailureSeconds = 3;
 static const int kMaxImmediateSleepFailures = 3;
 static const char *REMOTE_CONFIG_PATH =
@@ -103,6 +105,7 @@ static bool diagnostics_visible = false;
 static bool scheduled_sleep_disabled = false;
 static bool scheduled_sleep_low_battery = false;
 static int pending_sleep_seconds = 0;
+static time_t scheduled_refresh_deadline = 0;
 static int immediate_sleep_failures = 0;
 static int last_sleep_result = 0;
 static int last_sleep_elapsed_seconds = 0;
@@ -111,10 +114,12 @@ static time_t last_sleep_finished_time = 0;
 static time_t next_wake_time = 0;
 static bool last_wake_likely_rtc = false;
 static bool suppress_next_repaint = false;
+static time_t suppress_activation_until = 0;
 
 static void show_next_picture();
 static void refresh_remote_picture();
 static void enter_scheduled_sleep();
+static void arm_scheduled_sleep_chunk(int settle_milliseconds);
 static void release_network();
 static void draw_diagnostics();
 static void repaint_current_picture();
@@ -637,8 +642,36 @@ static bool battery_is_below_wake_threshold() {
 static void clear_scheduled_sleep() {
     ClearTimer(enter_scheduled_sleep);
     pending_sleep_seconds = 0;
+    scheduled_refresh_deadline = 0;
     next_wake_time = 0;
+    suppress_activation_until = 0;
     iv_sleepmode(0);
+}
+
+static void arm_scheduled_sleep_chunk(int settle_milliseconds) {
+    ClearTimer(enter_scheduled_sleep);
+    if (scheduled_refresh_deadline <= 0 || scheduled_sleep_disabled) {
+        return;
+    }
+
+    time_t now = time(NULL);
+    int remaining_seconds = static_cast<int>(scheduled_refresh_deadline - now);
+    if (remaining_seconds <= 5) {
+        pending_sleep_seconds = 0;
+        scheduled_refresh_deadline = 0;
+        next_wake_time = 0;
+        int refresh_delay = remaining_seconds > 0 ? remaining_seconds * 1000 : 100;
+        schedule_remote_refresh(refresh_delay);
+        return;
+    }
+
+    pending_sleep_seconds = remaining_seconds;
+    if (pending_sleep_seconds > kMaxRtcSleepChunkSeconds) {
+        pending_sleep_seconds = kMaxRtcSleepChunkSeconds;
+    }
+    next_wake_time = scheduled_refresh_deadline;
+    SetWeakTimer("PocketFrameSleep", enter_scheduled_sleep,
+                 settle_milliseconds);
 }
 
 static void schedule_scheduled_sleep(int delay_seconds) {
@@ -663,11 +696,9 @@ static void schedule_scheduled_sleep(int delay_seconds) {
         delay_seconds = kMaxPollSeconds;
     }
 
-    pending_sleep_seconds = delay_seconds;
-    next_wake_time = time(NULL) + delay_seconds +
-                     (kSleepSettleMilliseconds + 999) / 1000;
-    SetWeakTimer("PocketFrameSleep", enter_scheduled_sleep,
-                 kSleepSettleMilliseconds);
+    scheduled_refresh_deadline = time(NULL) + delay_seconds;
+    next_wake_time = scheduled_refresh_deadline;
+    arm_scheduled_sleep_chunk(kSleepSettleMilliseconds);
 }
 
 static void enter_scheduled_sleep() {
@@ -680,7 +711,6 @@ static void enter_scheduled_sleep() {
     int requested_seconds = pending_sleep_seconds;
     release_network();
     last_sleep_started_time = time(NULL);
-    next_wake_time = last_sleep_started_time + requested_seconds;
     iv_sleepmode(1);
     last_sleep_result = GoSleep(requested_seconds * 1000, 0);
     iv_sleepmode(0);
@@ -690,23 +720,33 @@ static void enter_scheduled_sleep() {
     last_wake_likely_rtc =
         last_sleep_elapsed_seconds >= requested_seconds - 5;
     suppress_next_repaint = true;
+    suppress_activation_until = last_sleep_finished_time + 6;
     pending_sleep_seconds = 0;
-    next_wake_time = 0;
 
     if (last_sleep_elapsed_seconds < kImmediateSleepFailureSeconds) {
         suppress_next_repaint = false;
         ++immediate_sleep_failures;
         if (immediate_sleep_failures >= kMaxImmediateSleepFailures) {
             scheduled_sleep_disabled = true;
+            scheduled_refresh_deadline = 0;
+            next_wake_time = 0;
             iv_sleepmode(1);
         } else {
-            schedule_scheduled_sleep(requested_seconds);
+            arm_scheduled_sleep_chunk(kSleepRetrySettleMilliseconds);
         }
         return;
     }
     immediate_sleep_failures = 0;
 
-    if (scheduled_sleep_low_battery && last_wake_likely_rtc &&
+    if (scheduled_refresh_deadline > last_sleep_finished_time + 5) {
+        arm_scheduled_sleep_chunk(kSleepRetrySettleMilliseconds);
+        return;
+    }
+
+    scheduled_refresh_deadline = 0;
+    next_wake_time = 0;
+
+    if (scheduled_sleep_low_battery &&
         battery_is_below_wake_threshold()) {
         schedule_scheduled_sleep(kMaxPollSeconds);
         return;
@@ -716,13 +756,14 @@ static void enter_scheduled_sleep() {
 
 static void format_diagnostic_time(time_t value, char *text, size_t text_size) {
     if (value <= 0) {
-        snprintf(text, text_size, "not available");
+        snprintf(text, text_size, "--");
         return;
     }
 
     struct tm *local = localtime(&value);
-    if (local == NULL || strftime(text, text_size, "%Y-%m-%d %H:%M", local) == 0) {
-        snprintf(text, text_size, "not available");
+    if (local == NULL ||
+        strftime(text, text_size, "%m-%d %H:%M", local) == 0) {
+        snprintf(text, text_size, "--");
     }
 }
 
@@ -733,7 +774,7 @@ static void draw_diagnostics() {
     int panel_y = (ScreenHeight() - panel_height) / 2;
     int margin = kFontSize * 2;
     int text_width = panel_width - margin * 2;
-    int line_height = kFontSize * 2;
+    int line_height = kFontSize * 4;
     int y = panel_y + margin;
     char now[32];
     char updated[32];
@@ -753,52 +794,44 @@ static void draw_diagnostics() {
     DrawRect(panel_x, panel_y, panel_width - 1, panel_height - 1, BLACK);
     DrawTextRect(panel_x + margin, y, text_width, line_height, "PocketFrame",
                  ALIGN_CENTER);
-    y += line_height * 2;
+    y += line_height + kFontSize;
 
-    snprintf(line, sizeof(line), "Time: %s", now);
+    snprintf(line, sizeof(line), "Now %s  Battery %d%%", now,
+             GetBatteryPower());
     DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
     y += line_height;
-    snprintf(line, sizeof(line), "Updated: %s", updated);
+    snprintf(line, sizeof(line), "Image %s", updated);
     DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
     y += line_height;
-    snprintf(line, sizeof(line), "Battery: %d%%", GetBatteryPower());
-    DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
-    y += line_height;
-    snprintf(line, sizeof(line), "Mode: %s",
+    snprintf(line, sizeof(line), "Mode %s",
              refresh_mode_name(remote_config.refresh_mode));
     DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
     y += line_height;
-    snprintf(line, sizeof(line), "Next wake: %s", wake);
+    snprintf(line, sizeof(line), "Next %s", wake);
     DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
     y += line_height;
-    snprintf(line, sizeof(line), "Checked: %s", checked);
-    DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
-    y += line_height;
-    snprintf(line, sizeof(line), "Last OK: %s", last_success);
-    DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
-    y += line_height;
-    snprintf(line, sizeof(line), "Network: %s, %ds",
-             last_network_attempt_time == 0 ? "none" :
-             (last_network_succeeded ? "OK" : "failed"),
+    snprintf(line, sizeof(line), "Net %s  %s %ds", checked,
+             last_network_attempt_time == 0 ? "--" :
+             (last_network_succeeded ? "OK" : "FAIL"),
              last_network_duration_seconds);
     DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
     y += line_height;
-    snprintf(line, sizeof(line), "Checks: %d OK, %d failed",
-             successful_network_checks, failed_network_checks);
+    snprintf(line, sizeof(line), "Last OK %s", last_success);
     DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
     y += line_height;
-    snprintf(line, sizeof(line), "Failures in row: %d",
+    snprintf(line, sizeof(line), "Checks %d/%d  Row %d",
+             successful_network_checks, failed_network_checks,
              consecutive_network_failures);
     DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
     y += line_height;
-    snprintf(line, sizeof(line), "Sleep: %ds rc=%d %s",
+    snprintf(line, sizeof(line), "Sleep %ds rc%d %s",
              last_sleep_elapsed_seconds, last_sleep_result,
-             last_sleep_started_time == 0 ? "none" :
-             (last_wake_likely_rtc ? "RTC" : "manual"));
+             last_sleep_started_time == 0 ? "--" :
+             (last_wake_likely_rtc ? "RTC" : "early"));
     DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
     y += line_height;
-    snprintf(line, sizeof(line), "Sleep guard: %s, battery: %s",
-             scheduled_sleep_disabled ? "disabled" : "OK",
+    snprintf(line, sizeof(line), "Guard %s  Battery %s",
+             scheduled_sleep_disabled ? "OFF" : "OK",
              scheduled_sleep_low_battery ? "low" : "OK");
     DrawTextRect(panel_x + margin, y, text_width, line_height, line, ALIGN_LEFT);
 
@@ -1122,6 +1155,9 @@ static int main_handler(int event_type, int param_one, int param_two) {
             repaint_current_picture();
         }
     } else if (EVT_FOREGROUND == event_type || EVT_ACTIVATE == event_type) {
+        if (time(NULL) < suppress_activation_until) {
+            return 0;
+        }
         clear_scheduled_sleep();
         if (suppress_next_repaint) {
             suppress_next_repaint = false;

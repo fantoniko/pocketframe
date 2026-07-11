@@ -26,6 +26,12 @@ services:
       POCKETFRAME_SCHEDULE_OFFSET_SECONDS: ${POCKETFRAME_SCHEDULE_OFFSET_SECONDS:-0}
       POCKETFRAME_READ_DELAY_SECONDS: ${POCKETFRAME_READ_DELAY_SECONDS:-300}
       POCKETFRAME_MISSING_SLOT_RETRY_SECONDS: ${POCKETFRAME_MISSING_SLOT_RETRY_SECONDS:-300}
+      POCKETFRAME_LOG_LEVEL: ${POCKETFRAME_LOG_LEVEL:-info}
+    logging:
+      driver: json-file
+      options:
+        max-size: "${POCKETFRAME_LOG_MAX_SIZE:-10m}"
+        max-file: "${POCKETFRAME_LOG_MAX_FILES:-3}"
     healthcheck:
       test: ["CMD", "/pocketframe-server", "healthcheck"]
       interval: 30s

@@ -74,6 +74,14 @@ successful interval; errors use the same exponential backoff. At or below
 sleeps for 24 hours at a time unless the device is charging. Three immediate
 `GoSleep` failures disable scheduled wakeups for the current app session.
 
+Testing on `PB740 / U740.6.5.1379` showed stable RTC sleeps through 45 minutes
+(`2701` seconds observed) while a 60-minute request returned about 59 seconds
+early. PocketFrame therefore keeps one absolute refresh deadline but executes
+long waits as RTC chunks of at most 45 minutes. Intermediate wakes wait five
+seconds and return to sleep without enabling Wi-Fi; only the final deadline
+causes a manifest request. This avoids both the firmware limit and unnecessary
+network power use.
+
 Scheduled sleep requires `Lock Device after = Off` and `Auto Power Off = Off`:
 PocketFrame performs suspend itself, while the system lock would move the app to
 the background and stop its cycle. Right/Page Forward still forces an immediate
@@ -171,6 +179,16 @@ manifest/frame request counters with their latest timestamps. These counters
 reset when the container restarts and make scheduled wakeups observable without
 touching the PocketBook. Uploads are limited both by encoded size and source
 pixel count; the defaults are 15 MB and 25 megapixels.
+
+The server writes structured JSON events to standard output for Portainer's
+**Container logs** view. At the default `POCKETFRAME_LOG_LEVEL=info`, useful
+events include `server_started`, `upload_accepted`, `upload_idempotent`,
+`upload_rejected`, `manifest_served`, `frame_served`, `frame_unavailable`, and
+shutdown events. Set the level to `debug` to also log `/status` reads, or to
+`warn` to keep only rejected requests and failures. Tokens, URL query strings,
+and image bodies are never logged. The Portainer stack rotates Docker's JSON
+logs at 10 MB and retains three files by default; adjust
+`POCKETFRAME_LOG_MAX_SIZE` and `POCKETFRAME_LOG_MAX_FILES` if required.
 
 For battery life, the default mode avoids timed polling. Each request connects
 only for the request and disconnects immediately afterwards, writes the flash
@@ -274,24 +292,24 @@ revision requires downloading the JPEG.
 `build/sleep-probe.app` tests whether the current PocketBook firmware can wake
 an InkView application from suspend using the RTC-backed `GoSleep` call. It is a
 separate application and does not change PocketFrame behavior, use Wi-Fi, write
-state files, or repeat the test automatically.
+state files, or contact the server.
 
 Before testing, temporarily set both `Lock Device after` and `Auto Power Off`
 to `Off`. Copy `sleep-probe.app` to the device `applications` directory, launch
 it, and press the Right/Page Forward button once. The probe paints its status,
-waits two seconds for the E-Ink update, and requests a 120-second sleep with
-`GoSleep(120000, 0)`.
+then automatically tests `GoSleep` intervals of 5, 15, 30, 45, and 60 minutes.
+It waits five seconds between stages so wake events and the E-Ink status update
+can settle. A complete successful run takes about 2 hours 36 minutes.
 
-Do not press a button for at least two minutes. A successful test returns to a
-result screen automatically and reports:
+Do not press any buttons while the suite is running. It stops at the first early
+return; otherwise it finishes after the 60-minute stage. The result screen
+reports:
 
-* start and finish time;
-* actual elapsed seconds;
-* the `GoSleep` result code;
-* battery percentage before and after.
+* requested and actual elapsed time for every interval;
+* the `GoSleep` result code and RTC classification for every stage;
+* total start/finish time and battery percentage before/after.
 
-If the result screen has not appeared after three minutes, press the power or
-Right/Page Forward button once. The probe will classify an early return as
-interrupted or unsupported. Wait three seconds before pressing Right/Page
-Forward to start another cycle; this debounce prevents the wakeup key from
-immediately starting a new sleep. Back or Home exits the probe.
+If the screen has not changed several minutes after the expected end of a stage,
+press the power button once; that stage will be classified as an early/manual
+return. Photograph the final table. Right/Page Forward starts the entire suite
+again; Back or Home exits the probe.

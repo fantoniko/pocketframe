@@ -15,7 +15,7 @@ import (
 	"image/jpeg"
 	_ "image/png"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -50,6 +50,7 @@ type config struct {
 	readDelaySeconds        int
 	missingSlotRetrySeconds int
 	metadataPath            string
+	logLevel                string
 }
 
 type metadata struct {
@@ -85,22 +86,26 @@ type publication struct {
 }
 
 type statusResponse struct {
-	Ready                 bool   `json:"ready"`
-	Revision              string `json:"revision,omitempty"`
-	UpdatedAt             string `json:"updated_at,omitempty"`
-	PublicationID         string `json:"publication_id,omitempty"`
-	PublicationSlot       int64  `json:"publication_slot,omitempty"`
-	ScheduledAt           string `json:"scheduled_at,omitempty"`
-	ReadyAt               string `json:"ready_at,omitempty"`
-	UpdateReady           bool   `json:"update_ready"`
-	FrameBytes            int64  `json:"frame_bytes,omitempty"`
-	TargetWidth           int    `json:"target_width"`
-	TargetHeight          int    `json:"target_height"`
-	NextPollSeconds       int    `json:"next_poll_seconds"`
-	ManifestRequests      uint64 `json:"manifest_requests"`
-	LastManifestRequestAt string `json:"last_manifest_request_at,omitempty"`
-	FrameRequests         uint64 `json:"frame_requests"`
-	LastFrameRequestAt    string `json:"last_frame_request_at,omitempty"`
+	Ready                   bool   `json:"ready"`
+	ServerTime              string `json:"server_time"`
+	UptimeSeconds           int64  `json:"uptime_seconds"`
+	PublicationState        string `json:"publication_state"`
+	ExpectedPublicationSlot int64  `json:"expected_publication_slot"`
+	Revision                string `json:"revision,omitempty"`
+	UpdatedAt               string `json:"updated_at,omitempty"`
+	PublicationID           string `json:"publication_id,omitempty"`
+	PublicationSlot         int64  `json:"publication_slot,omitempty"`
+	ScheduledAt             string `json:"scheduled_at,omitempty"`
+	ReadyAt                 string `json:"ready_at,omitempty"`
+	UpdateReady             bool   `json:"update_ready"`
+	FrameBytes              int64  `json:"frame_bytes,omitempty"`
+	TargetWidth             int    `json:"target_width"`
+	TargetHeight            int    `json:"target_height"`
+	NextPollSeconds         int    `json:"next_poll_seconds"`
+	ManifestRequests        uint64 `json:"manifest_requests"`
+	LastManifestRequestAt   string `json:"last_manifest_request_at,omitempty"`
+	FrameRequests           uint64 `json:"frame_requests"`
+	LastFrameRequestAt      string `json:"last_frame_request_at,omitempty"`
 }
 
 type server struct {
@@ -114,12 +119,20 @@ type server struct {
 	frameRequests         uint64
 	lastFrameRequestAt    time.Time
 	now                   func() time.Time
+	startedAt             time.Time
+	logger                *slog.Logger
 }
 
 func main() {
+	logger, err := newLogger(getenv("POCKETFRAME_LOG_LEVEL", "info"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	slog.SetDefault(logger)
 	if len(os.Args) == 2 && os.Args[1] == "healthcheck" {
 		if err := runHealthcheck(); err != nil {
-			log.Print(err)
+			slog.Error("healthcheck failed", "event", "healthcheck_failed", "error", err)
 			os.Exit(1)
 		}
 		return
@@ -127,12 +140,14 @@ func main() {
 
 	config, err := loadConfig()
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("configuration rejected", "event", "configuration_rejected", "error", err)
+		os.Exit(1)
 	}
 
-	server := &server{config: config}
+	server := &server{config: config, logger: logger, startedAt: time.Now().UTC()}
 	if err := server.loadExistingFrame(); err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Fatalf("load existing frame: %v", err)
+		slog.Error("existing frame rejected", "event", "frame_state_rejected", "error", err)
+		os.Exit(1)
 	}
 
 	mux := http.NewServeMux()
@@ -144,7 +159,18 @@ func main() {
 	mux.HandleFunc("POST /api/frame", server.upload)
 
 	address := ":" + getenv("PORT", "8080")
-	log.Printf("PocketFrame server listening on %s", address)
+	slog.Info("PocketFrame server started",
+		"event", "server_started", "address", address,
+		"frame_ready", server.meta.revision != "", "mode", config.mode,
+		"publication_state", server.publicationState(server.meta, server.currentTime()),
+		"publication_id", server.meta.publicationID,
+		"publication_slot", server.meta.publicationSlot,
+		"revision", server.meta.revision,
+		"quality", config.quality, "schedule_period_seconds", config.schedulePeriodSeconds,
+		"schedule_offset_seconds", config.scheduleOffsetSeconds,
+		"read_delay_seconds", config.readDelaySeconds,
+		"missing_slot_retry_seconds", config.missingSlotRetrySeconds,
+		"legacy_upload_query", config.legacyUploadQuery, "log_level", config.logLevel)
 	httpServer := &http.Server{
 		Addr:              address,
 		Handler:           mux,
@@ -163,15 +189,36 @@ func main() {
 	select {
 	case err := <-serverErrors:
 		if !errors.Is(err, http.ErrServerClosed) {
-			log.Fatal(err)
+			slog.Error("HTTP server stopped", "event", "server_failed", "error", err)
+			os.Exit(1)
 		}
-	case <-signals:
+	case signal := <-signals:
+		slog.Info("shutdown requested", "event", "shutdown_requested", "signal", signal.String())
 		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := httpServer.Shutdown(shutdownContext); err != nil {
-			log.Printf("graceful shutdown: %v", err)
+			slog.Error("graceful shutdown failed", "event", "shutdown_failed", "error", err)
+			return
 		}
+		slog.Info("PocketFrame server stopped", "event", "server_stopped")
 	}
+}
+
+func newLogger(levelName string) (*slog.Logger, error) {
+	var level slog.Level
+	switch strings.ToLower(strings.TrimSpace(levelName)) {
+	case "debug":
+		level = slog.LevelDebug
+	case "info", "":
+		level = slog.LevelInfo
+	case "warn", "warning":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		return nil, errors.New("POCKETFRAME_LOG_LEVEL must be debug, info, warn, or error")
+	}
+	return slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level})), nil
 }
 
 func loadConfig() (config, error) {
@@ -250,6 +297,7 @@ func loadConfig() (config, error) {
 		readDelaySeconds:        readDelaySeconds,
 		missingSlotRetrySeconds: missingSlotRetrySeconds,
 		metadataPath:            getenv("POCKETFRAME_METADATA_PATH", framePath+".json"),
+		logLevel:                strings.ToLower(getenv("POCKETFRAME_LOG_LEVEL", "info")),
 	}, nil
 }
 
@@ -303,6 +351,13 @@ func (s *server) currentTime() time.Time {
 	return time.Now().UTC()
 }
 
+func (s *server) log() *slog.Logger {
+	if s.logger != nil {
+		return s.logger
+	}
+	return slog.Default()
+}
+
 func (s *server) schedulePeriod() int64 {
 	if s.config.schedulePeriodSeconds > 0 {
 		return int64(s.config.schedulePeriodSeconds)
@@ -317,6 +372,23 @@ func (s *server) expectedSlot(at time.Time) int64 {
 	period := s.schedulePeriod()
 	offset := int64(s.config.scheduleOffsetSeconds)
 	return ((at.Unix() - offset) / period * period) + offset
+}
+
+func (s *server) publicationState(meta metadata, now time.Time) string {
+	if meta.revision == "" {
+		return "empty"
+	}
+	expectedSlot := s.expectedSlot(now)
+	if meta.publicationSlot < expectedSlot {
+		return "missing_current_slot"
+	}
+	if meta.publicationSlot > expectedSlot {
+		return "future_slot"
+	}
+	if now.Before(meta.readyAt) {
+		return "waiting_ready_at"
+	}
+	return "ready"
 }
 
 func (s *server) manifestTiming(meta metadata, now time.Time) (bool, int, int) {
@@ -355,12 +427,22 @@ func (s *server) manifest(writer http.ResponseWriter, request *http.Request) {
 	now := s.currentTime()
 	s.lastManifestRequestAt = now
 	meta := s.meta
+	manifestRequests := s.manifestRequests
 	s.mu.Unlock()
 	if meta.revision == "" {
+		s.log().Warn("manifest unavailable", "event", "manifest_unavailable",
+			"state", "empty", "manifest_requests", manifestRequests)
 		http.Error(writer, "frame is not ready", http.StatusServiceUnavailable)
 		return
 	}
 
+	ready, nextPoll, retryAfter := s.manifestTiming(meta, now)
+	s.log().Info("manifest served", "event", "manifest_served",
+		"state", s.publicationState(meta, now), "update_ready", ready,
+		"publication_id", meta.publicationID, "publication_slot", meta.publicationSlot,
+		"expected_publication_slot", s.expectedSlot(now),
+		"next_poll_seconds", nextPoll, "retry_after_seconds", retryAfter,
+		"manifest_requests", manifestRequests)
 	s.writeManifest(writer, http.StatusOK, meta, now)
 }
 
@@ -374,12 +456,20 @@ func (s *server) frame(writer http.ResponseWriter, request *http.Request) {
 	now := s.currentTime()
 	s.lastFrameRequestAt = now
 	meta := s.meta
+	frameRequests := s.frameRequests
 	s.mu.Unlock()
 	if meta.revision == "" || now.Before(meta.readyAt) {
+		s.log().Warn("frame unavailable", "event", "frame_unavailable",
+			"state", s.publicationState(meta, now), "publication_id", meta.publicationID,
+			"publication_slot", meta.publicationSlot, "frame_requests", frameRequests)
 		http.Error(writer, "frame is not ready", http.StatusServiceUnavailable)
 		return
 	}
 
+	s.log().Info("frame served", "event", "frame_served",
+		"publication_id", meta.publicationID, "publication_slot", meta.publicationSlot,
+		"revision", meta.revision, "frame_bytes", meta.frameBytes,
+		"frame_requests", frameRequests)
 	writer.Header().Set("Cache-Control", "no-store")
 	writer.Header().Set("Content-Type", "image/jpeg")
 	http.ServeFile(writer, request, s.config.framePath)
@@ -397,15 +487,25 @@ func (s *server) status(writer http.ResponseWriter, request *http.Request) {
 	frameRequests := s.frameRequests
 	lastFrameRequestAt := s.lastFrameRequestAt
 	s.mu.RUnlock()
-	response := statusResponse{
-		Ready:            meta.revision != "",
-		TargetWidth:      targetWidth,
-		TargetHeight:     targetHeight,
-		NextPollSeconds:  s.config.nextPollSeconds,
-		ManifestRequests: manifestRequests,
-		FrameRequests:    frameRequests,
+	now := s.currentTime()
+	updateReady, nextPoll, _ := s.manifestTiming(meta, now)
+	startedAt := s.startedAt
+	if startedAt.IsZero() {
+		startedAt = now
 	}
-	response.UpdateReady, _, _ = s.manifestTiming(meta, s.currentTime())
+	response := statusResponse{
+		Ready:                   meta.revision != "",
+		ServerTime:              now.Format(time.RFC3339),
+		UptimeSeconds:           int64(now.Sub(startedAt).Seconds()),
+		PublicationState:        s.publicationState(meta, now),
+		ExpectedPublicationSlot: s.expectedSlot(now),
+		TargetWidth:             targetWidth,
+		TargetHeight:            targetHeight,
+		NextPollSeconds:         nextPoll,
+		ManifestRequests:        manifestRequests,
+		FrameRequests:           frameRequests,
+	}
+	response.UpdateReady = updateReady
 	if !lastManifestRequestAt.IsZero() {
 		response.LastManifestRequestAt = lastManifestRequestAt.Format(time.RFC3339)
 	}
@@ -428,6 +528,9 @@ func (s *server) status(writer http.ResponseWriter, request *http.Request) {
 		writer.WriteHeader(http.StatusServiceUnavailable)
 	}
 	json.NewEncoder(writer).Encode(response)
+	s.log().Debug("status served", "event", "status_served",
+		"state", response.PublicationState, "update_ready", response.UpdateReady,
+		"manifest_requests", manifestRequests, "frame_requests", frameRequests)
 }
 
 func (s *server) upload(writer http.ResponseWriter, request *http.Request) {
@@ -435,15 +538,18 @@ func (s *server) upload(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	if !isSupportedImage(request.Header.Get("Content-Type")) {
+		s.logUploadRejected(request, "unsupported_media_type", nil)
 		http.Error(writer, "use image/jpeg, image/png, or image/gif", http.StatusUnsupportedMediaType)
 		return
 	}
 	if request.ContentLength > s.config.maxUploadBytes {
+		s.logUploadRejected(request, "content_length_exceeded", nil)
 		http.Error(writer, "image is too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 	publication, err := s.parsePublication(request)
 	if err != nil {
+		s.logUploadRejected(request, "invalid_publication_metadata", err)
 		http.Error(writer, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -455,9 +561,14 @@ func (s *server) upload(writer http.ResponseWriter, request *http.Request) {
 	s.mu.RUnlock()
 	if currentMeta.idempotencyKey != "" && currentMeta.idempotencyKey == publication.idempotencyKey {
 		if currentMeta.publicationID != publication.id || currentMeta.publicationSlot != publication.slot {
+			s.logUploadRejected(request, "idempotency_conflict", nil)
 			http.Error(writer, "idempotency key conflicts with the current publication", http.StatusConflict)
 			return
 		}
+		s.log().Info("idempotent upload reused", "event", "upload_idempotent",
+			"publication_id", currentMeta.publicationID,
+			"publication_slot", currentMeta.publicationSlot,
+			"revision", currentMeta.revision, "frame_bytes", currentMeta.frameBytes)
 		s.writeManifest(writer, http.StatusOK, currentMeta, s.currentTime())
 		return
 	}
@@ -465,27 +576,48 @@ func (s *server) upload(writer http.ResponseWriter, request *http.Request) {
 	if currentMeta.publicationSlot > publication.slot ||
 		(currentMeta.publicationSlot == publication.slot && currentMeta.publicationID != publication.id &&
 			!currentIsLegacy && !publication.legacy) {
+		s.logUploadRejected(request, "stale_or_conflicting_slot", nil)
 		http.Error(writer, "publication slot is stale or already has another publication", http.StatusConflict)
 		return
 	}
 	request.Body = http.MaxBytesReader(writer, request.Body, s.config.maxUploadBytes)
 	encoded, err := io.ReadAll(request.Body)
 	if err != nil {
+		s.logUploadRejected(request, "body_read_failed", err)
 		http.Error(writer, "image is too large or could not be read", http.StatusRequestEntityTooLarge)
 		return
 	}
 	if len(encoded) == 0 {
+		s.logUploadRejected(request, "empty_body", nil)
 		http.Error(writer, "image body is required", http.StatusBadRequest)
 		return
 	}
 
 	meta, err := s.publishForPublication(encoded, publication)
 	if err != nil {
-		log.Printf("reject upload: %v", err)
+		s.logUploadRejected(request, "image_processing_failed", err)
 		http.Error(writer, "could not process image", http.StatusBadRequest)
 		return
 	}
+	s.log().Info("frame uploaded", "event", "upload_accepted",
+		"legacy", publication.legacy, "publication_id", meta.publicationID,
+		"publication_slot", meta.publicationSlot, "revision", meta.revision,
+		"input_bytes", len(encoded), "frame_bytes", meta.frameBytes,
+		"received_at", meta.publishedAt.Format(time.RFC3339),
+		"ready_at", meta.readyAt.Format(time.RFC3339))
 	s.writeManifest(writer, http.StatusCreated, meta, s.currentTime())
+}
+
+func (s *server) logUploadRejected(request *http.Request, reason string, err error) {
+	attributes := []any{
+		"event", "upload_rejected", "reason", reason,
+		"content_type", request.Header.Get("Content-Type"),
+		"content_length", request.ContentLength,
+	}
+	if err != nil {
+		attributes = append(attributes, "error", err)
+	}
+	s.log().Warn("upload rejected", attributes...)
 }
 
 func (s *server) parsePublication(request *http.Request) (publication, error) {
@@ -558,6 +690,8 @@ func secureTokenEqual(actual, expected string) bool {
 
 func (s *server) authorizedRead(writer http.ResponseWriter, request *http.Request) bool {
 	if !secureTokenEqual(request.URL.Query().Get("token"), s.config.readToken) {
+		s.log().Warn("read authorization rejected", "event", "authorization_rejected",
+			"operation", "read", "path", request.URL.Path)
 		http.NotFound(writer, request)
 		return false
 	}
@@ -574,6 +708,8 @@ func (s *server) authorizedUpload(writer http.ResponseWriter, request *http.Requ
 		secureTokenEqual(request.URL.Query().Get("token"), s.config.uploadToken) {
 		return true
 	}
+	s.log().Warn("upload authorization rejected", "event", "authorization_rejected",
+		"operation", "upload", "path", request.URL.Path)
 	http.NotFound(writer, request)
 	return false
 }

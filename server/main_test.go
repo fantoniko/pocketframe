@@ -5,6 +5,7 @@ import (
 	"image"
 	"image/color"
 	"image/jpeg"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -157,6 +158,8 @@ func TestStatusRequiresTokenAndReturnsFrameMetadata(t *testing.T) {
 	server := &server{
 		config:                testConfig(filepath.Join(t.TempDir(), "frame.jpg")),
 		meta:                  metadata{revision: "abc123", publicationID: "pocketframe-1783684800", publicationSlot: 1783684800, scheduledAt: updated, publishedAt: updated, readyAt: updated, idempotencyKey: "pocketframe-1783684800", frameBytes: 4567},
+		now:                   func() time.Time { return updated.Add(5 * time.Minute) },
+		startedAt:             updated,
 		manifestRequests:      7,
 		lastManifestRequestAt: updated,
 		frameRequests:         3,
@@ -184,6 +187,12 @@ func TestStatusRequiresTokenAndReturnsFrameMetadata(t *testing.T) {
 		t.Fatalf("status body = %s, want %s", got, want)
 	}
 	if got, want := response.Body.String(), "\"frame_requests\":3"; !bytes.Contains([]byte(got), []byte(want)) {
+		t.Fatalf("status body = %s, want %s", got, want)
+	}
+	if got, want := response.Body.String(), "\"publication_state\":\"ready\""; !strings.Contains(got, want) {
+		t.Fatalf("status body = %s, want %s", got, want)
+	}
+	if got, want := response.Body.String(), "\"server_time\":\"2026-07-10T12:05:00Z\""; !strings.Contains(got, want) {
 		t.Fatalf("status body = %s, want %s", got, want)
 	}
 }
@@ -454,5 +463,58 @@ func TestNextPollUsesAbsoluteHourlySlot(t *testing.T) {
 	ready, nextPoll, _ = server.manifestTiming(meta, slot.Add(59*time.Minute+50*time.Second))
 	if !ready || nextPoll != 5*60+10 {
 		t.Fatalf("12:59:50 timing = ready %v, next %d; want true, 310", ready, nextPoll)
+	}
+}
+
+func TestStructuredLogsDescribeEventsWithoutLeakingTokens(t *testing.T) {
+	now := time.Date(2026, time.July, 10, 12, 0, 0, 0, time.UTC)
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	server := &server{
+		config: testConfig(filepath.Join(t.TempDir(), "frame.jpg")),
+		now:    func() time.Time { return now },
+		logger: logger,
+	}
+
+	unauthorized := httptest.NewRecorder()
+	server.status(unauthorized, httptest.NewRequest(http.MethodGet,
+		"/status?token=read-secret-that-must-not-appear", nil))
+
+	upload := httptest.NewRequest(http.MethodPost, "/api/frame",
+		bytes.NewReader(encodeTestJPEG(t, 8, 8)))
+	upload.Header.Set("Content-Type", "image/jpeg")
+	upload.Header.Set("Authorization", "Bearer "+server.config.uploadToken)
+	setPublicationHeaders(upload, now.Unix(), 300)
+	response := httptest.NewRecorder()
+	server.upload(response, upload)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("upload = %d: %s", response.Code, response.Body.String())
+	}
+
+	output := logs.String()
+	for _, expected := range []string{
+		`"event":"authorization_rejected"`,
+		`"path":"/status"`,
+		`"event":"upload_accepted"`,
+		`"publication_id":"pocketframe-` + strconv.FormatInt(now.Unix(), 10) + `"`,
+	} {
+		if !strings.Contains(output, expected) {
+			t.Fatalf("logs %q do not contain %q", output, expected)
+		}
+	}
+	for _, secret := range []string{
+		"read-secret-that-must-not-appear",
+		server.config.uploadToken,
+		"?token=",
+	} {
+		if strings.Contains(output, secret) {
+			t.Fatalf("logs leaked %q: %s", secret, output)
+		}
+	}
+}
+
+func TestNewLoggerRejectsUnknownLevel(t *testing.T) {
+	if _, err := newLogger("verbose"); err == nil {
+		t.Fatal("newLogger accepted an unknown level")
 	}
 }
